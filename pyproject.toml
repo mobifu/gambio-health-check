@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = [
+    "E402",  # Module level import not at top of file
+    "F401",  # Unused import (z.B. Cython Import Check in build.py)
+    "E501",  # Line too long
+    "E722",  # Bare except
+    "F841",  # Unused local variable
+    "F811",  # Redefinition of unused import
+]

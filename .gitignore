@@ -1,0 +1,28 @@
+# Build-Artefakte & Releases
+HealthCheckModul-v*
+HealthCheckModul-v*.zip
+dist_*
+build_temp_*
+*.spec
+Bilder/
+
+# PyInstaller / Build-Ausgaben
+build/
+dist/
+
+# Python & Virtualenv
+__pycache__/
+*.py[cod]
+venv/
+.pytest_cache/
+.pytest_cache_tmp/
+.pytest_temp/
+.file_snapshot.json
+.agignore
+.coverage
+
+# Temporäre Daten & Profil-Logs/Hashes
+profiles/*/logs/
+profiles/*/hashes/
+*.log
+config.dat
