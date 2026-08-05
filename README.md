@@ -212,6 +212,12 @@ pre-commit install
 pre-commit run --all-files
 ```
 
+Folgende automatische Prüfungen sind aktiv:
+* **Standard-Checks:** Trailing Whitespace, End-of-File, YAML-Syntax, Large Files, Python-AST-Syntax, Case-Conflicts, Merge-Conflicts, Debug-Statements (z. B. `breakpoint()`), Private Key Detection.
+* **Ruff:** Statische Code-Analyse & Formatierung (`ruff` mit `--fix` und `ruff-format`).
+* **Bandit:** Sicherheitsanalyse.
+* **Pytest:** Automatischer Lauf aller Unit-Tests.
+
 ### Build-Prozess & Quality Gate
 
 Der Build-Prozess startet über `build.py` und durchläuft vor jeder Kompilierung
