@@ -1270,7 +1270,7 @@ class HealthCheckPage(QWidget):
                 if self.worker._is_cancelled:
                     return []
             else:
-                folders = [f.name for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
+                folders = [f.filename for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
 
             versioned_folders = []
             for f in folders:

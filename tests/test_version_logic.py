@@ -1028,3 +1028,28 @@ def test_legacy_delete_worker_clear_cache_sftp(page):
 
     # Geschützte Systemdatei verschont
     assert call("cache/.htaccess") not in conn.remove.call_args_list
+
+
+def test_analyze_delete_history_sftp_attributes():
+    """Testet, dass _analyze_delete_history mit Paramiko SFTPAttributes (entry.filename) korrekt arbeitet."""
+    import stat
+
+    page = MagicMock()
+    conn = MagicMock()
+    page.sftp_conn = conn
+    page.ftp_conn = None
+
+    attr = MagicMock()
+    attr.filename = "v4.0.0.0"
+    attr.st_mode = stat.S_IFDIR
+
+    conn.listdir_attr.return_value = [attr]
+
+    # Simuliere _analyze_delete_history Aufruf auf MainWindow
+    main_win = MagicMock()
+    main_win._analyze_delete_history = lambda connection: [
+        f.filename for f in connection.listdir_attr("gambio_updater/updates") if stat.S_ISDIR(f.st_mode)
+    ]
+
+    folders = main_win._analyze_delete_history(conn)
+    assert folders == ["v4.0.0.0"]

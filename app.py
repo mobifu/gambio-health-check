@@ -1,4 +1,4 @@
-SOFTWARE_VERSION = "1.1.3"
+SOFTWARE_VERSION = "1.1.4"
 import sys
 import os
 
