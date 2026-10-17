@@ -1,30 +1,48 @@
 import ftplib
-import stat
+import hashlib
 import io
+import json
+import logging
 import os
 import re
-import json
-import hashlib
-import logging
+import stat
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class HashCheckEngine:
     """
-    Berechnet, speichert und vergleicht SHA-256 Hashes von Shop-Dateien.
-    Erkennt Abweichungen und potenzielle Malware-Indikatoren.
+    Berechnet, speichert und vergleicht SHA-256 Hashes von Shop-Dateien über FTP/SFTP.
+    Erkennt Abweichungen, fehlende oder manipulierte Dateien und potenzielle Malware-Indikatoren.
     """
 
-    def __init__(self, profile_name, conn, signal=None, logger=None, worker=None):
+    def __init__(
+        self,
+        profile_name: str,
+        conn: Any,
+        signal: Any = None,
+        logger: logging.Logger | None = None,
+        worker: Any = None,
+    ):
         self.profile_name = profile_name
         self.conn = conn
         self.signal = signal
         self.logger = logger or logging.getLogger(__name__)
         self.worker = worker
-        # Sonderzeichen und Leerzeichen für Pfadsicherheit entfernen
-        safe_name = re.sub(r'[\\/*?:"<>| &]', "_", profile_name)
-        self.hash_dir = os.path.join("profiles", safe_name, "hashes")
-        os.makedirs(self.hash_dir, exist_ok=True)
-        self.baseline_path = os.path.join(self.hash_dir, "baseline.json")
+
+        # Pfadsicherheit via pathlib und Path Traversal Absicherung
+        base_profiles_dir = Path("profiles").resolve()
+        safe_name = re.sub(r'[\\/*?:"<>| &]', "_", str(profile_name).strip())
+        if not safe_name:
+            safe_name = "default"
+
+        target_dir = (base_profiles_dir / safe_name / "hashes").resolve()
+        if not target_dir.is_relative_to(base_profiles_dir):
+            target_dir = (base_profiles_dir / "default" / "hashes").resolve()
+
+        self.hash_dir = str(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self.baseline_path = str(target_dir / "baseline.json")
         self.logger.info(f"Hash-Engine bereit. Speicherort: {self.hash_dir}")
 
         # Startverzeichnis für FTP merken, um Pfad-Desync zu verhindern
@@ -32,21 +50,22 @@ class HashCheckEngine:
         if isinstance(self.conn, ftplib.FTP):
             try:
                 self._ftp_root = self.conn.pwd()
-            except:
-                pass
+            except (ftplib.Error, OSError) as e:
+                self.logger.debug(f"Konnte initiales FTP-Arbeitsverzeichnis nicht ermitteln: {e}")
 
         # Ignorierte Dateien laden
-        self.excluded_list = []
+        self.excluded_list: list[str] = []
         if self.worker and hasattr(self.worker, "page") and hasattr(self.worker.page, "config_manager"):
             excluded_str = self.worker.page.config_manager.get_excluded_files()
-            self.excluded_list = [f.strip() for f in excluded_str.split(",") if f.strip()]
+            if excluded_str:
+                self.excluded_list = [f.strip() for f in excluded_str.split(",") if f.strip()]
 
-    def _progress(self, msg):
+    def _progress(self, msg: str) -> None:
         """Aktualisiert die Status-Anzeige (oben) via Worker-Signal."""
-        if self.worker:
+        if self.worker and hasattr(self.worker, "progress_signal"):
             self.worker.progress_signal.emit(msg)
 
-    def _log(self, msg, status="ok", skip_ui=False):
+    def _log(self, msg: str, status: str = "ok", skip_ui: bool = False) -> None:
         """Sendet Nachricht an UI und schreibt ins Datei-Log."""
         if self.logger:
             if status == "ok":
@@ -59,12 +78,12 @@ class HashCheckEngine:
         if self.signal and not skip_ui:
             self.signal.emit(msg, status)
 
-    def generate_hash(self, remote_path):
+    def generate_hash(self, remote_path: str) -> tuple[str | None, bytes | None]:
         """Lädt eine Datei herunter und berechnet den SHA-256 Hash. Gibt (hash, content) zurück."""
         # Pfad-Validierung gegen Directory Traversal
         normalized = remote_path.replace("\\", "/")
         if ".." in normalized.split("/") or normalized.startswith("/") or ":" in normalized:
-            if not (self.worker and self.worker._is_cancelled):
+            if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
                 self._log(
                     f"Ungültiger oder gefährlicher Pfad blockiert: {remote_path}",
                     "warn",
@@ -81,9 +100,9 @@ class HashCheckEngine:
                 try:
                     self.conn.retrbinary(f"RETR {remote_path}", buf.write)
                 except Exception:
-                    # Versuch 2: Fallback mit Navigation (für sehr restriktive Server)
+                    # Versuch 2: Fallback mit Navigation (für restriktive Server)
                     buf = io.BytesIO()
-                    parts = remote_path.replace("\\", "/").split("/")
+                    parts = normalized.split("/")
                     filename = parts[-1]
                     dirs = parts[:-1]
                     self.conn.cwd(self._ftp_root)
@@ -104,14 +123,17 @@ class HashCheckEngine:
             data = buf.getvalue()
             return hashlib.sha256(data).hexdigest(), data
         except Exception as e:
-            if not (self.worker and self.worker._is_cancelled):
+            if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
                 self._log(f"Datei konnte nicht gelesen werden: {remote_path} ({e})", "warn")
             return None, None
 
-    def _check_malware_indicators(self, data, path):
+    def _check_malware_indicators(self, data: bytes | None, path: str) -> None:
         """Sucht nach verdächtigen PHP-Funktionen und Payloads."""
+        if not data or not isinstance(data, (bytes, bytearray)):
+            return
+
         indicators = [b"eval", b"base64_decode", b"gzinflate", b"system", b"shell_exec"]
-        found = [ind.decode() for ind in indicators if ind in data]
+        found = [ind.decode("ascii") for ind in indicators if ind in data]
 
         # Suche nach langen Base64-Strings (Payload-Verdacht)
         if re.search(rb"[A-Za-z0-9+/]{128,}", data):
@@ -120,11 +142,10 @@ class HashCheckEngine:
         if found:
             self._log(f"Verdächtiger Code in {path} ({', '.join(found)} gefunden)", "error")
 
-    def _get_remote_files_recursive(self, path="."):
+    def _get_remote_files_recursive(self, path: str = ".") -> list[str]:
         """Listet Dateien rekursiv auf (begrenzt auf relevante Shop-Ordner)."""
-        files = []
-        # node_modules bleibt ausgeschlossen, vendor wird nun gehasht
-        skip_dirs = [
+        files: list[str] = []
+        skip_dirs = {
             "images",
             "cache",
             "logs",
@@ -134,18 +155,27 @@ class HashCheckEngine:
             "uploads",
             "node_modules",
             ".git",
-        ]
+        }
+        media_extensions = (
+            ".pdf",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".bmp",
+            ".svg",
+        )
 
         # Startverzeichnis merken für FTP, um es am Ende wiederherzustellen
         start_dir = "."
         if isinstance(self.conn, ftplib.FTP):
             try:
                 start_dir = self.conn.pwd()
-            except:
+            except (ftplib.Error, OSError):
                 pass
 
-        def walk(current_path):
-            if self.worker and self.worker._is_cancelled:
+        def walk(current_path: str) -> None:
+            if self.worker and getattr(self.worker, "_is_cancelled", False):
                 return
             self._progress(f"Scanne: {current_path}")
             try:
@@ -154,11 +184,11 @@ class HashCheckEngine:
                     try:
                         items = list(self.conn.mlsd())
                         if not items:
-                            raise ValueError("MLSD empty")  # Force fallback in case of mocked MLSD
+                            raise ValueError("MLSD empty")
                         for name, attrs in items:
-                            if name in [".", ".."] or not name:
+                            if name in {".", ".."} or not name:
                                 continue
-                            if any(sd == name for sd in skip_dirs):
+                            if name in skip_dirs:
                                 continue
 
                             full_item = name if current_path == "." else f"{current_path}/{name}"
@@ -173,19 +203,16 @@ class HashCheckEngine:
                                     walk(full_item)
                                 finally:
                                     self.conn.cwd("..")
-                            elif target_type in ["file", "os.unix.slink", ""]:
-                                # Skip PDF and image files from hashing
+                            elif target_type in {"file", "os.unix.slink", ""}:
                                 lower_item = full_item.lower()
-                                if lower_item.endswith(".pdf") or lower_item.endswith(
-                                    (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg")
-                                ):
+                                if lower_item.endswith(media_extensions):
                                     continue
                                 files.append(full_item)
                                 self._log(f"Datei gefunden: {full_item}", skip_ui=True)
 
                     except Exception:
                         # Fallback: LIST-Befehl parsen (robuster als nlst)
-                        lines = []
+                        lines: list[str] = []
                         try:
                             self.conn.retrlines("LIST", lines.append)
                         except Exception:
@@ -197,25 +224,16 @@ class HashCheckEngine:
                                 names = self.conn.nlst()
                                 for item_name in names:
                                     name = item_name.replace("\\", "/").split("/")[-1]
-                                    if name in [".", ".."] or not name:
+                                    if name in {".", ".."} or not name:
                                         continue
-                                    if any(sd == name for sd in skip_dirs):
+                                    if name in skip_dirs:
                                         continue
 
                                     full_item = name if current_path == "." else f"{current_path}/{name}"
 
                                     if "." in name:
                                         lower_item = full_item.lower()
-                                        if lower_item.endswith(".pdf") or lower_item.endswith(
-                                            (
-                                                ".png",
-                                                ".jpg",
-                                                ".jpeg",
-                                                ".gif",
-                                                ".bmp",
-                                                ".svg",
-                                            )
-                                        ):
+                                        if lower_item.endswith(media_extensions):
                                             continue
                                         files.append(full_item)
                                         self._log(
@@ -243,15 +261,14 @@ class HashCheckEngine:
                             for line in lines:
                                 if not line:
                                     continue
-                                # Einfaches Parsing für Unix-Style (erster Buchstabe d=Ordner, -=Datei)
                                 parts = line.split()
                                 if len(parts) < 9:
                                     continue
                                 name = line.split(None, 8)[-1]
 
-                                if name in [".", ".."] or not name:
+                                if name in {".", ".."} or not name:
                                     continue
-                                if any(sd == name for sd in skip_dirs):
+                                if name in skip_dirs:
                                     continue
 
                                 full_item = name if current_path == "." else f"{current_path}/{name}"
@@ -265,18 +282,9 @@ class HashCheckEngine:
                                         walk(full_item)
                                     finally:
                                         self.conn.cwd("..")
-                                elif line.startswith("-") or line.startswith("l"):
+                                elif line.startswith(("-", "l")):
                                     lower_item = full_item.lower()
-                                    if lower_item.endswith(".pdf") or lower_item.endswith(
-                                        (
-                                            ".png",
-                                            ".jpg",
-                                            ".jpeg",
-                                            ".gif",
-                                            ".bmp",
-                                            ".svg",
-                                        )
-                                    ):
+                                    if lower_item.endswith(media_extensions):
                                         continue
                                     files.append(full_item)
                                     self._log(
@@ -284,7 +292,7 @@ class HashCheckEngine:
                                         skip_ui=True,
                                     )
                                 else:
-                                    # Unbekanntes Format (z.B. Windows), versuche CWD-Test
+                                    # Unbekanntes Format (z.B. Windows FTP), CWD-Test
                                     is_dir = False
                                     try:
                                         self.conn.cwd(name)
@@ -299,53 +307,38 @@ class HashCheckEngine:
                                             self.conn.cwd("..")
                                     else:
                                         lower_item = full_item.lower()
-                                        if lower_item.endswith(".pdf") or lower_item.endswith(
-                                            (
-                                                ".png",
-                                                ".jpg",
-                                                ".jpeg",
-                                                ".gif",
-                                                ".bmp",
-                                                ".svg",
-                                            )
-                                        ):
+                                        if lower_item.endswith(media_extensions):
                                             continue
                                         files.append(full_item)
 
                 else:  # SFTP
                     for entry in self.conn.listdir_attr(current_path):
-                        if entry.filename in [".", ".."] or entry.filename in skip_dirs:
-                            try:
-                                continue
-                            except:
-                                pass
+                        if entry.filename in {".", ".."} or entry.filename in skip_dirs:
+                            continue
 
                         full_p = f"{current_path}/{entry.filename}".replace("./", "")
                         if stat.S_ISDIR(entry.st_mode):
                             walk(full_p)
                         else:
-                            # Skip PDF and image files from hashing
                             lower_path = full_p.lower()
-                            if lower_path.endswith(".pdf") or lower_path.endswith(
-                                (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg")
-                            ):
+                            if lower_path.endswith(media_extensions):
                                 continue
                             files.append(full_p)
                             self._log(f"Datei gefunden: {full_p}", skip_ui=True)
             except Exception as e:
-                if not (self.worker and self.worker._is_cancelled):
+                if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
                     self.logger.warning(f"Verzeichnis übersprungen oder leer: {current_path} ({e})")
 
         walk(path)
-        # Am Ende sicherstellen, dass wir wieder im Startverzeichnis für den nächsten Schritt sind
+        # Am Ende wiederherstellen des ursprünglichen FTP-Arbeitsverzeichnisses
         if isinstance(self.conn, ftplib.FTP):
             try:
                 self.conn.cwd(start_dir)
-            except:
+            except (ftplib.Error, OSError):
                 pass
         return files
 
-    def generate_baseline(self):
+    def generate_baseline(self) -> None:
         """Erzeugt die baseline.json für alle aktuellen Shop-Dateien."""
         self._progress("Suche Dateien auf dem Server...")
         self._log("Suche Dateien für Baseline-Scan...")
@@ -358,58 +351,62 @@ class HashCheckEngine:
             )
             return
 
-        hashes = {}
+        hashes: dict[str, str] = {}
         total = len(remote_files)
         self._log(f"Gefunden: {total} Dateien. Starte Hashing...", "ok")
 
-        processed_count = 0
         try:
             for i, f in enumerate(remote_files):
-                if self.worker and self.worker._is_cancelled:
+                if self.worker and getattr(self.worker, "_is_cancelled", False):
                     break
 
                 # Check ignored list
                 if any(ex in f for ex in self.excluded_list):
                     continue
 
-                # UI-Update-Intervall vergrößern für bessere Performance
                 if i % 500 == 0:
                     self._progress(f"Hashe {i + 1}/{total}: {os.path.basename(f)}")
 
                 h, _ = self.generate_hash(f)
                 if h:
                     hashes[f] = h
-                    processed_count += 1
-
-                # Zwischenspeichern für Performance bei großen Shops entfernt
-                # Die Daten werden zuverlässig im finally-Block gespeichert.
         finally:
-            # Immer speichern, auch bei Abbruch oder leeren Listen (hilft bei Diagnose)
-            with open(self.baseline_path, "w", encoding="utf-8") as out_f:
-                json.dump(hashes, out_f, indent=4)
+            # Immer speichern, auch bei Abbruch (hilft bei Diagnose)
+            try:
+                with open(self.baseline_path, "w", encoding="utf-8") as out_f:
+                    json.dump(hashes, out_f, indent=4)
+            except OSError as e:
+                self.logger.error(f"Fehler beim Speichern der Baseline in {self.baseline_path}: {e}")
 
-            if not (self.worker and self.worker._is_cancelled) and hashes:
+            if not (self.worker and getattr(self.worker, "_is_cancelled", False)) and hashes:
                 self._log(f"Baseline erfolgreich erstellt ({len(hashes)} Dateien).", "ok")
 
-    def generate_update_hashes(self, update_version, file_list):
+    def generate_update_hashes(self, update_version: str, file_list: list[str]) -> None:
         """Speichert Hashes für Dateien eines spezifischen Updates."""
-        path = os.path.join(self.hash_dir, f"update_{update_version}.json")
-        hashes = {}
+        target_file = Path(self.hash_dir) / f"update_{update_version}.json"
+        hashes: dict[str, str] = {}
         for f in file_list:
             h, _ = self.generate_hash(f)
             if h:
                 hashes[f] = h
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(hashes, f, indent=4)
+        try:
+            with open(target_file, "w", encoding="utf-8") as f:
+                json.dump(hashes, f, indent=4)
+        except OSError as e:
+            self.logger.error(f"Fehler beim Speichern der Update-Hashes in {target_file}: {e}")
 
-    def compare_with_baseline(self):
+    def compare_with_baseline(self) -> None:
         """Vergleicht den aktuellen Server-Zustand mit der Baseline."""
         if not os.path.exists(self.baseline_path):
             self._log("Keine Baseline vorhanden. Bitte zuerst erzeugen.", "warn")
             return
 
-        with open(self.baseline_path, "r") as f:
-            baseline = json.load(f)
+        try:
+            with open(self.baseline_path, "r", encoding="utf-8") as f:
+                baseline = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self._log(f"Fehler beim Laden der Baseline {self.baseline_path}: {e}", "error")
+            return
 
         self._progress("Suche Dateien für Vergleich...")
         self._log("Starte Hash-Vergleich mit Baseline...")
@@ -417,7 +414,7 @@ class HashCheckEngine:
         total = len(current_files)
 
         for i, f in enumerate(current_files):
-            if self.worker and self.worker._is_cancelled:
+            if self.worker and getattr(self.worker, "_is_cancelled", False):
                 return
 
             # Check ignored list
@@ -439,8 +436,6 @@ class HashCheckEngine:
                     "warn",
                 )
                 self._check_malware_indicators(data, f)
-            # else:
-            #     self.logger.info(f"Hash OK: {f}") # Deaktiviert für Performance bei >50k Dateien
 
         for f in baseline:
             if any(ex in f for ex in self.excluded_list):
@@ -448,14 +443,18 @@ class HashCheckEngine:
             if f not in current_files:
                 self._log(f"Datei fehlt: {f}", "error")
 
-    def compare_with_update_hashes(self, update_version):
+    def compare_with_update_hashes(self, update_version: str) -> None:
         """Prüft, ob Update-Dateien korrekt auf dem Server liegen."""
-        path = os.path.join(self.hash_dir, f"update_{update_version}.json")
-        if not os.path.exists(path):
+        target_file = os.path.join(self.hash_dir, f"update_{update_version}.json")
+        if not os.path.exists(target_file):
             return
 
-        with open(path, "r") as f:
-            update_hashes = json.load(f)
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                update_hashes = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.logger.error(f"Fehler beim Laden der Update-Hashes aus {target_file}: {e}")
+            return
 
         self._log(f"Prüfe Integrität von Update {update_version}...")
         for f, expected_h in update_hashes.items():

@@ -1,13 +1,57 @@
-import time
+"""
+security/master_password.py
+
+Verwaltet das Master-Passwort, Brute-Force-Schutz und Session-Locking.
+"""
+
+from __future__ import annotations
+
 import getpass
-from pathlib import Path
+import time
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, Optional, Union
+
 from security.exceptions import (
     InvalidMasterPasswordError,
-    TooManyFailedAttemptsError,
     SessionExpiredError,
+    TooManyFailedAttemptsError,
 )
+
+
+class SessionLock:
+    """Verwaltet den Session-Status basierend auf zeitlicher Inaktivität."""
+
+    DEFAULT_TIMEOUT_MINUTES: int = 10
+
+    def __init__(
+        self,
+        config_path: Union[str, Path] = "config.dat",
+        timeout_minutes: Union[int, float] = DEFAULT_TIMEOUT_MINUTES,
+    ) -> None:
+        # Pfad strikt via pathlib.Path.resolve() absichern
+        self.config_path: str = str(Path(config_path).resolve())
+        self.timeout: timedelta = timedelta(minutes=timeout_minutes)
+        self.last_activity: datetime = datetime.now()
+
+    def update_activity(self) -> None:
+        """Aktualisiert den Zeitstempel der letzten Aktivität."""
+        self.last_activity = datetime.now()
+
+    def is_expired(self) -> bool:
+        """Prüft, ob der Inaktivitätszeitraum überschritten wurde."""
+        return datetime.now() - self.last_activity > self.timeout
+
+    def remaining_seconds(self) -> float:
+        """Gibt die verbleibende Session-Gültigkeit in Sekunden zurück (mindestens 0.0)."""
+        elapsed = datetime.now() - self.last_activity
+        remaining = self.timeout.total_seconds() - elapsed.total_seconds()
+        return max(0.0, remaining)
+
+    def require_active_session(self) -> None:
+        """Wirft SessionExpiredError, falls die Session nicht mehr gültig ist."""
+        if self.is_expired():
+            raise SessionExpiredError("Session abgelaufen. Bitte erneut anmelden.")
 
 
 class MasterPasswordManager:
@@ -17,36 +61,53 @@ class MasterPasswordManager:
     Das Passwort wird nur im RAM vorgehalten und niemals geloggt.
     """
 
-    def __init__(self, is_new_setup=False):
-        super().__init__()
-        self.is_new_setup = is_new_setup
+    MAX_ATTEMPTS_BEFORE_DELAY: int = 3
+    MAX_FAILED_ATTEMPTS: int = 10
+    MAX_DELAY_SECONDS: int = 32
+
+    def __init__(
+        self,
+        is_new_setup: bool = False,
+        session_lock: Optional[SessionLock] = None,
+        timeout_minutes: int = SessionLock.DEFAULT_TIMEOUT_MINUTES,
+    ) -> None:
+        self.is_new_setup: bool = is_new_setup
         self._master_password: Optional[str] = None
         self._failed_attempts: int = 0
-        self._max_attempts_before_delay: int = 3
-        self._session_lock = SessionLock()
+        self._max_attempts_before_delay: int = self.MAX_ATTEMPTS_BEFORE_DELAY
+        self._session_lock: SessionLock = (
+            session_lock if session_lock is not None else SessionLock(timeout_minutes=timeout_minutes)
+        )
 
-    def prompt_password(self) -> str:
-        """
-        Fragt das Passwort sicher über das Terminal ab (ohne Echo).
-        """
-        return getpass.getpass("Master-Passwort eingeben: ")
+    @property
+    def failed_attempts(self) -> int:
+        """Gibt die Anzahl bisheriger Fehlversuche zurück."""
+        return self._failed_attempts
 
-    def set_password(self, password: str):
+    @property
+    def session_lock(self) -> SessionLock:
+        """Gibt das zugeordnete SessionLock-Objekt zurück."""
+        return self._session_lock
+
+    def has_password(self) -> bool:
+        """Prüft, ob aktuell ein Passwort im Speicher hinterlegt ist."""
+        return self._master_password is not None
+
+    def prompt_password(self, prompt: str = "Master-Passwort eingeben: ") -> str:
+        """Fragt das Passwort sicher über das Terminal ab (ohne Echo)."""
+        return getpass.getpass(prompt)
+
+    def set_password(self, password: str) -> None:
         """
-        Speichert das Passwort im RAM. Sollte nur nach erfolgreicher Validierung aufgerufen werden.
-        Das Passwort wird nach Gebrauch aus dem Speicher gelöscht, um Risiken zu minimieren.
+        Speichert das Passwort im RAM.
+        Setzt Fehlversuche zurück und aktualisiert die Session-Aktivität.
         """
         self._master_password = password
         self.reset_attempts()
         self.update_activity()
-        # Sicheres Löschen des Passworts aus der lokalen Variable nach Verwendung
-        # Hinweis: In Python ist das komplette Zeroing nicht garantiert, aber wir entfernen Referenzen.
-        # Der Aufrufer (z.B. app.py) sollte das Passwort-Objekt nach Nutzung auf None setzen.
 
     def get_password(self) -> Optional[str]:
-        """
-        Gibt das aktuell im RAM befindliche Passwort zurück.
-        """
+        """Gibt das aktuell im RAM befindliche Passwort zurück."""
         return self._master_password
 
     def verify_password(self, password: str, test_func: Callable[[str], bool]) -> bool:
@@ -61,7 +122,7 @@ class MasterPasswordManager:
         self._handle_failure()
         return False
 
-    def _handle_failure(self):
+    def _handle_failure(self) -> None:
         """
         Interner Mechanismus für Fehlversuche.
         Erzwingt ab dem 3. Versuch eine exponentiell steigende Verzögerung.
@@ -69,67 +130,41 @@ class MasterPasswordManager:
         self._failed_attempts += 1
 
         if self._failed_attempts >= self._max_attempts_before_delay:
-            # Verzögerung: 2s, 4s, 8s, 16s, 32s
-            delay = min(32, 2 ** (self._failed_attempts - 2))
+            # Verzögerung: 2s, 4s, 8s, 16s, 32s (gedeckelt bei MAX_DELAY_SECONDS)
+            delay = min(self.MAX_DELAY_SECONDS, 2 ** (self._failed_attempts - 2))
             time.sleep(delay)
 
-            if self._failed_attempts >= 10:
+            if self._failed_attempts >= self.MAX_FAILED_ATTEMPTS:
                 raise TooManyFailedAttemptsError("Maximale Anzahl an Versuchen erreicht. System gesperrt.")
 
         raise InvalidMasterPasswordError("Ungültiges Master-Passwort.")
 
-    def clear(self):
-        """Löscht das Passwort aus dem RAM und entfernt Referenzen für den Garbage Collector."""
-        # Versuchen, das Passwort zu überschreiben, bevor die Referenz gelöscht wird
+    def clear(self) -> None:
+        """Löscht das Passwort aus dem RAM und überschreibt temporäre Speicherbereiche."""
         if self._master_password is not None:
             try:
-                # Convert to mutable bytearray if possible
                 pwd_bytes = bytearray(self._master_password.encode("utf-8"))
                 for i in range(len(pwd_bytes)):
                     pwd_bytes[i] = 0
-            finally:
+                del pwd_bytes
+            except Exception:
                 pass
         self._master_password = None
 
-    def reset_attempts(self):
+    def reset_attempts(self) -> None:
         """Setzt den Fehlversuch-Zähler zurück."""
         self._failed_attempts = 0
 
     def is_session_expired(self) -> bool:
-        """Prüft über den internen SessionLock, ob die Session abgelaufen ist."""
+        """Prüft über das interne SessionLock, ob die Session abgelaufen ist."""
         return self._session_lock.is_expired()
 
-    def update_activity(self):
+    def update_activity(self) -> None:
         """Aktualisiert den Zeitstempel der letzten Aktivität im SessionLock."""
         self._session_lock.update_activity()
 
-    def require_active_session(self):
+    def require_active_session(self) -> None:
         """Prüft die Session, löscht bei Ablauf das Passwort aus dem RAM und wirft ggf. SessionExpiredError."""
         if self.is_session_expired():
             self.clear()
-            raise SessionExpiredError("Session abgelaufen. Bitte erneut anmelden.")
-
-
-class SessionLock:
-    """
-    Verwaltet den Session-Status basierend auf zeitlicher Inaktivität.
-    """
-
-    def __init__(self, config_path="config.dat", timeout_minutes: int = 10):
-        # Verwende absoluten Pfad, um Pfadmanipulation zu verhindern
-        self.config_path = str(Path(config_path).resolve())
-        self.timeout = timedelta(minutes=timeout_minutes)
-        self.last_activity = datetime.now()
-
-    def update_activity(self):
-        """Aktualisiert den Zeitstempel der letzten Aktivität."""
-        self.last_activity = datetime.now()
-
-    def is_expired(self) -> bool:
-        """Prüft, ob der Inaktivitätszeitraum überschritten wurde."""
-        return datetime.now() - self.last_activity > self.timeout
-
-    def require_active_session(self):
-        """Wirft eine SessionExpiredError, wenn die Session nicht mehr gültig ist."""
-        if self.is_expired():
             raise SessionExpiredError("Session abgelaufen. Bitte erneut anmelden.")

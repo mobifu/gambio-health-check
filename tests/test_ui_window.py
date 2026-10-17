@@ -386,11 +386,15 @@ def test_config_page_test_connection_ftp(qapp, auth_and_config):
         }
     )
 
-    # Mock ftplib.FTP
-    with patch("ftplib.FTP") as mock_ftp_class:
+    # Mock ftplib.FTP_TLS und ftplib.FTP
+    with (
+        patch("ftplib.FTP_TLS") as mock_ftp_tls_class,
+        patch("ftplib.FTP") as mock_ftp_class,
+    ):
         mock_ftp = MagicMock()
         mock_ftp.nlst.return_value = ["system", "GXEngine"]
-        mock_ftp_class.return_value.__enter__.return_value = mock_ftp
+        mock_ftp_tls_class.return_value = mock_ftp
+        mock_ftp_class.return_value = mock_ftp
 
         page._test_connection()
 
@@ -445,3 +449,64 @@ def test_global_cancel_button(qapp, auth_and_config):
 
     # Verify cancel_all was called
     health_page.cancel_all.assert_called_once()
+
+
+def test_config_page_toggle_password(qapp, auth_and_config):
+    from PySide6.QtWidgets import QLineEdit
+
+    auth, config = auth_and_config
+    page = ConfigPage(auth, config)
+
+    # Initialzustand
+    assert page.edit_password.echoMode() == QLineEdit.Password
+    assert page.btn_toggle_password.text() == "Anzeigen"
+
+    # Umschalten auf Klartext
+    page.btn_toggle_password.click()
+    assert page.edit_password.echoMode() == QLineEdit.Normal
+    assert page.btn_toggle_password.text() == "Verbergen"
+
+    # Umschalten zurück auf Maskiert
+    page.btn_toggle_password.click()
+    assert page.edit_password.echoMode() == QLineEdit.Password
+    assert page.btn_toggle_password.text() == "Anzeigen"
+
+    # Beim Setzen von Profildaten wird Maskierung wieder aktiviert
+    page.btn_toggle_password.click()
+    assert page.edit_password.echoMode() == QLineEdit.Normal
+    page._set_profile_data({"password": "secret"})
+    assert page.edit_password.echoMode() == QLineEdit.Password
+    assert page.btn_toggle_password.text() == "Anzeigen"
+
+    # Beim Leeren von Feldern wird Maskierung wieder aktiviert
+    page.btn_toggle_password.click()
+    assert page.edit_password.echoMode() == QLineEdit.Normal
+    page._clear_profile_fields()
+    assert page.edit_password.echoMode() == QLineEdit.Password
+    assert page.btn_toggle_password.text() == "Anzeigen"
+
+
+def test_open_path_nonexistent():
+    from ui.main_window import open_path
+
+    with patch("os.startfile") as mock_startfile, patch("subprocess.run") as mock_run:
+        open_path("C:/pfad/der/nicht/existiert_12345.xyz")
+        mock_startfile.assert_not_called()
+        mock_run.assert_not_called()
+
+
+def test_open_path_existing(tmp_path):
+    from ui.main_window import open_path
+
+    dummy_file = tmp_path / "test.txt"
+    dummy_file.write_text("ok", encoding="utf-8")
+
+    # Auf Windows os.startfile testen
+    with patch("platform.system", return_value="Windows"), patch("os.startfile") as mock_start:
+        open_path(str(dummy_file))
+        mock_start.assert_called_once_with(str(dummy_file.resolve()))
+
+    # Auf Linux subprocess testen
+    with patch("platform.system", return_value="Linux"), patch("subprocess.run") as mock_run:
+        open_path(str(dummy_file))
+        mock_run.assert_called_once_with(["xdg-open", str(dummy_file.resolve())], check=True)

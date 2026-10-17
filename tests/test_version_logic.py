@@ -1031,25 +1031,25 @@ def test_legacy_delete_worker_clear_cache_sftp(page):
 
 
 def test_analyze_delete_history_sftp_attributes():
-    """Testet, dass _analyze_delete_history mit Paramiko SFTPAttributes (entry.filename) korrekt arbeitet."""
+    """Testet, dass SFTPAttributes nur '.filename' und kein '.name' besitzt."""
     import stat
+    from unittest.mock import Mock
 
-    page = MagicMock()
-    conn = MagicMock()
-    page.sftp_conn = conn
-    page.ftp_conn = None
-
-    attr = MagicMock()
+    # Paramiko SFTPAttributes besitzt 'filename', aber kein 'name'
+    attr = Mock(spec=["filename", "st_mode"])
     attr.filename = "v4.0.0.0"
     attr.st_mode = stat.S_IFDIR
 
+    conn = Mock()
     conn.listdir_attr.return_value = [attr]
 
-    # Simuliere _analyze_delete_history Aufruf auf MainWindow
-    main_win = MagicMock()
-    main_win._analyze_delete_history = lambda connection: [
-        f.filename for f in connection.listdir_attr("gambio_updater/updates") if stat.S_ISDIR(f.st_mode)
-    ]
-
-    folders = main_win._analyze_delete_history(conn)
+    # Prüfung, dass f.filename korrekt ausgelesen wird
+    folders = [f.filename for f in conn.listdir_attr("gambio_updater/updates") if stat.S_ISDIR(f.st_mode)]
     assert folders == ["v4.0.0.0"]
+
+    # Sicherstellen, dass kein Zugriff auf das nicht existierende Attribut 'name' erfolgt
+    try:
+        _ = attr.name
+        assert False, "Attribut 'name' sollte auf SFTPAttributes nicht existieren"
+    except AttributeError:
+        pass

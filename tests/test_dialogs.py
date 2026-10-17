@@ -61,3 +61,108 @@ def test_shop_profile_dialog(qapp):
 def test_show_error(mock_critical, qapp):
     show_error("Test Error Message")
     mock_critical.assert_called_once()
+
+
+def test_shop_profile_dialog_toggle_password(qapp):
+    from PySide6.QtWidgets import QLineEdit
+
+    dialog = ShopProfileDialog()
+    assert dialog.edit_password.echoMode() == QLineEdit.Password
+    assert dialog.btn_toggle_password.text() == "Anzeigen"
+
+    dialog.btn_toggle_password.click()
+    assert dialog.edit_password.echoMode() == QLineEdit.Normal
+    assert dialog.btn_toggle_password.text() == "Verbergen"
+
+    dialog.btn_toggle_password.click()
+    assert dialog.edit_password.echoMode() == QLineEdit.Password
+    assert dialog.btn_toggle_password.text() == "Anzeigen"
+
+
+def test_shop_profile_dialog_data_get_set(qapp):
+    dialog = ShopProfileDialog()
+    test_data = {
+        "shop_name": "Mein Shop",
+        "host": "sftp.meinedomain.de",
+        "port": 2222,
+        "username": "admin",
+        "password": "geheim123",
+        "protocol": "SFTP",
+    }
+    dialog.set_profile_data(test_data)
+    extracted = dialog.get_profile_data()
+
+    assert extracted["shop_name"] == "Mein Shop"
+    assert extracted["host"] == "sftp.meinedomain.de"
+    assert extracted["port"] == 2222
+    assert extracted["username"] == "admin"
+    assert extracted["password"] == "geheim123"
+    assert extracted["protocol"] == "SFTP"
+
+
+def test_shop_profile_dialog_protocol_auto_port(qapp):
+    dialog = ShopProfileDialog()
+    dialog.edit_port.setText("21")
+
+    # Wechsel auf SFTP sollte Port auf 22 setzen
+    dialog.combo_protocol.setCurrentText("SFTP")
+    assert dialog.edit_port.text() == "22"
+
+    # Wechsel auf HTTPS sollte Port auf 443 setzen
+    dialog.combo_protocol.setCurrentText("HTTPS")
+    assert dialog.edit_port.text() == "443"
+
+    # Wechsel auf FTP sollte Port auf 21 setzen
+    dialog.combo_protocol.setCurrentText("FTP")
+    assert dialog.edit_port.text() == "21"
+
+
+def test_shop_profile_dialog_validation_failures(qapp):
+    dialog = ShopProfileDialog()
+
+    with patch("ui.dialogs.show_error") as mock_err:
+        # 1. Kein Shop-Name
+        dialog.edit_shop_name.setText("")
+        dialog.edit_host.setText("example.com")
+        dialog.accept()
+        mock_err.assert_called_with("Bitte geben Sie einen Shop-Namen an.", parent=dialog)
+
+        # 2. Kein Host
+        dialog.edit_shop_name.setText("Shop")
+        dialog.edit_host.setText("")
+        dialog.accept()
+        mock_err.assert_called_with("Bitte geben Sie einen Server-Host an.", parent=dialog)
+
+        # 3. Ungültiger Port
+        dialog.edit_host.setText("example.com")
+        dialog.edit_port.setText("99999")
+        dialog.accept()
+        mock_err.assert_called_with("Der Port muss zwischen 1 und 65535 liegen.", parent=dialog)
+
+        dialog.edit_port.setText("abc")
+        dialog.accept()
+        mock_err.assert_called_with("Der Port muss eine gültige Ganzzahl sein.", parent=dialog)
+
+
+def test_master_password_empty_validation(qapp):
+    dialog = MasterPasswordDialog(is_new_setup=False)
+    dialog.edit_password.setText("")
+
+    with patch("ui.dialogs.show_error") as mock_err:
+        dialog.accept()
+        mock_err.assert_called_with("Bitte geben Sie ein Master-Passwort ein.")
+
+
+def test_show_info_and_confirmation(qapp):
+    from ui.dialogs import show_info, ask_confirmation
+    from PySide6.QtWidgets import QMessageBox
+
+    with patch.object(QMessageBox, "information") as mock_info:
+        show_info("Nachricht", title="Titel")
+        mock_info.assert_called_once()
+
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+        assert ask_confirmation("Sicher?") is True
+
+    with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+        assert ask_confirmation("Sicher?") is False

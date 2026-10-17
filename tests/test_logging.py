@@ -106,3 +106,47 @@ def test_logging_config_sensitive_filter():
     assert len(logging.root.handlers) > 0
     for handler in logging.root.handlers:
         assert any(isinstance(f, SensitiveFilter) for f in handler.filters)
+
+
+def test_sanitize_sensitive_data_direct():
+    from logging_config import sanitize_sensitive_data
+
+    # Direktaufruf der Sanitization-Funktion
+    assert sanitize_sensitive_data("pass=topsecret") == "pass=********"
+    assert sanitize_sensitive_data('{"token": "xyz123"}') == '{"token": "********"}'
+    # Nicht-String Eingaben
+    assert sanitize_sensitive_data(12345) == "12345"
+    assert sanitize_sensitive_data(None) == "None"
+
+
+def test_sensitive_filter_with_args():
+    import logging
+    from logging_config import SensitiveFilter
+
+    filter_obj = SensitiveFilter()
+    rec = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname="test.py",
+        lineno=1,
+        msg="Login fehlgeschlagen für %s mit Token %s",
+        args=("user_admin", "token=secret456"),
+        exc_info=None,
+    )
+    assert filter_obj.filter(rec) is True
+    assert "secret456" not in rec.msg
+    assert "token=********" in rec.msg
+    assert rec.args == ()
+
+
+def test_setup_logging_idempotent():
+    import logging
+    from logging_config import setup_logging, SensitiveFilter
+
+    setup_logging(level=logging.DEBUG)
+    count_before = sum(1 for h in logging.root.handlers for f in h.filters if isinstance(f, SensitiveFilter))
+
+    # Zweiter Aufruf sollte keine doppelten Filter registrieren
+    setup_logging(level=logging.DEBUG)
+    count_after = sum(1 for h in logging.root.handlers for f in h.filters if isinstance(f, SensitiveFilter))
+    assert count_before == count_after

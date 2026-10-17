@@ -1,6 +1,7 @@
 import pytest
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 from security.master_password import MasterPasswordManager, SessionLock
 from security.exceptions import (
@@ -14,6 +15,7 @@ def test_master_password_setting():
     manager = MasterPasswordManager()
     manager.set_password("test_pass")
     assert manager.get_password() == "test_pass"
+    assert manager.has_password() is True
 
 
 def test_failed_attempts_delay(monkeypatch):
@@ -36,7 +38,8 @@ def test_failed_attempts_delay(monkeypatch):
     mock_sleep.assert_called_with(2)
 
 
-def test_too_many_attempts():
+def test_too_many_attempts(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda x: None)
     manager = MasterPasswordManager()
     # Simuliere 10 Fehlversuche
     manager._failed_attempts = 9
@@ -68,6 +71,7 @@ def test_verify_password_success():
     success = manager.verify_password("correct", lambda p: p == "correct")
     assert success is True
     assert manager._failed_attempts == 0
+    assert manager.failed_attempts == 0
 
 
 def test_session_expired_clears_password():
@@ -83,6 +87,7 @@ def test_session_expired_clears_password():
 
     # Passwort muss aus dem RAM genullt sein!
     assert manager.get_password() is None
+    assert manager.has_password() is False
 
 
 def test_prompt_password(monkeypatch):
@@ -94,8 +99,10 @@ def test_prompt_password(monkeypatch):
 def test_clear_method_robustness():
     manager = MasterPasswordManager()
     manager.set_password("abc")
+    assert manager.has_password() is True
     manager.clear()
     assert manager.get_password() is None
+    assert manager.has_password() is False
 
 
 def test_brute_force_exponential_backoff_steps(monkeypatch):
@@ -160,3 +167,25 @@ def test_session_lock_inactivity_clears_ram():
         manager.require_active_session()
 
     assert manager.get_password() is None
+
+
+def test_session_lock_remaining_seconds():
+    lock = SessionLock(timeout_minutes=1)
+    remaining = lock.remaining_seconds()
+    assert 0 < remaining <= 60
+
+    # Nach Ablauf muss remaining_seconds() 0.0 zurückgeben
+    lock.last_activity = datetime.now() - timedelta(minutes=2)
+    assert lock.remaining_seconds() == 0.0
+
+
+def test_session_lock_custom_injection():
+    custom_lock = SessionLock(timeout_minutes=5)
+    manager = MasterPasswordManager(session_lock=custom_lock)
+    assert manager.session_lock is custom_lock
+    assert manager.session_lock.timeout == timedelta(minutes=5)
+
+
+def test_session_lock_config_path_resolve():
+    lock = SessionLock(config_path="subfolder/../config.dat")
+    assert lock.config_path == str(Path("config.dat").resolve())

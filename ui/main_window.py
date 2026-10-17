@@ -11,13 +11,12 @@ import json
 import logging
 import configparser
 import secrets
-from datetime import datetime
+import datetime
+from pathlib import Path
+from typing import Union
 
 try:
     import requests  # type: ignore
-    import urllib3  # type: ignore
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     requests = None
 try:
@@ -62,20 +61,20 @@ from core.reporting import generate_html_report, generate_pdf_report
 logger = logging.getLogger(__name__)
 
 
-def open_path(path):
+def open_path(path: Union[str, Path]) -> None:
     """Öffnet einen Pfad oder eine Datei im systemstandard-Explorer/App."""
-    abs_path = os.path.abspath(path)
-    if not os.path.exists(abs_path):
+    resolved_path = Path(path).resolve()
+    if not resolved_path.exists():
         return
     try:
         if platform.system() == "Windows":
-            os.startfile(abs_path)
+            os.startfile(str(resolved_path))
         elif platform.system() == "Darwin":
-            subprocess.run(["open", abs_path], check=True)
+            subprocess.run(["open", str(resolved_path)], check=True)
         else:
-            subprocess.run(["xdg-open", abs_path], check=True)
+            subprocess.run(["xdg-open", str(resolved_path)], check=True)
     except Exception as e:
-        logger.error(f"Fehler beim Öffnen von {abs_path}: {e}")
+        logger.error(f"Fehler beim Öffnen von {resolved_path}: {e}")
 
 
 class HealthCheckWorker(QThread):
@@ -269,7 +268,7 @@ class HealthCheckWorker(QThread):
             if self._is_cancelled:
                 return
             self.progress_signal.emit("Analysiere Altlasten...")
-            legacy_files = self.page._run_legacy_delete_analysis_logic(conn, self.result_signal)
+            legacy_files = self.page._run_legacy_delete_analysis_logic(conn, self.result_signal, profile=self.profile)
             self.legacy_files_signal.emit(legacy_files)
 
         except Exception as e:
@@ -679,9 +678,6 @@ class BakFileScannerWorker(QThread):
                 except:
                     pass
             self.finished_signal.emit(self.bak_files)
-
-
-import datetime
 
 
 class LogfileWorker(QThread):
@@ -1244,11 +1240,36 @@ class HealthCheckPage(QWidget):
         else:
             self.status_label.setText("Kein Health-Check läuft.")
 
-    def _run_legacy_delete_analysis_logic(self, conn, signal=None):
+    def _ensure_connection(self, conn, profile=None):
+        """Prüft, ob die FTP/SFTP-Verbindung noch aktiv ist, und stellt sie bei Bedarf transparent wieder her."""
+        if conn is not None:
+            try:
+                if isinstance(conn, ftplib.FTP):
+                    conn.voidcmd("NOOP")
+                    return conn
+                else:
+                    transport = conn.get_channel().get_transport()
+                    if transport and transport.is_active():
+                        return conn
+            except Exception:
+                pass  # Verbindung ist unterbrochen
+
+        if profile:
+            try:
+                new_conn, _ = self._check_connection(profile)
+                if new_conn:
+                    return new_conn
+            except Exception:
+                pass
+        return conn
+
+    def _run_legacy_delete_analysis_logic(self, conn, signal=None, profile=None):
         """
         Analysiert alle Update-Ordner chronologisch auf zu löschende Dateien.
         Berücksichtigt Konflikte durch Wiedereinführung von Dateien.
         """
+        if profile is None and hasattr(self, "worker") and self.worker:
+            profile = getattr(self.worker, "profile", None)
 
         def log(msg, status="ok"):
             if signal:
@@ -1264,13 +1285,23 @@ class HealthCheckPage(QWidget):
         added_map = {}  # Datei -> Letzte Version, in der sie geändert/hinzugefügt wurde
 
         try:
+            # Verbindung sicherstellen (Reconnect falls nach vorherigen Scans geschlossen)
+            conn = self._ensure_connection(conn, profile)
+
             # 1. Update-Ordner auslesen & sortieren
-            if isinstance(conn, ftplib.FTP):
-                folders = [f.split("/")[-1].split("\\")[-1] for f in conn.nlst(update_base)]
-                if self.worker._is_cancelled:
-                    return []
-            else:
-                folders = [f.filename for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
+            try:
+                if isinstance(conn, ftplib.FTP):
+                    folders = [f.split("/")[-1].split("\\")[-1] for f in conn.nlst(update_base)]
+                    if self.worker and getattr(self.worker, "_is_cancelled", False):
+                        return []
+                else:
+                    folders = [f.filename for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
+            except Exception:
+                conn = self._ensure_connection(None, profile)
+                if isinstance(conn, ftplib.FTP):
+                    folders = [f.split("/")[-1].split("\\")[-1] for f in conn.nlst(update_base)]
+                else:
+                    folders = [f.filename for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
 
             versioned_folders = []
             for f in folders:
@@ -1287,7 +1318,7 @@ class HealthCheckPage(QWidget):
 
             # 2. Alle to_delete.php und updated_files.txt sammeln
             for v_tuple, folder_name in versioned_folders:
-                if self.worker._is_cancelled:
+                if self.worker and getattr(self.worker, "_is_cancelled", False):
                     return []
                 path = f"{update_base}/{folder_name}"
 
@@ -1296,7 +1327,15 @@ class HealthCheckPage(QWidget):
                     content = ""
                     if isinstance(conn, ftplib.FTP):
                         r_io = io.BytesIO()
-                        conn.retrbinary(f"RETR {path}/to_delete.php", r_io.write)
+                        try:
+                            conn.retrbinary(f"RETR {path}/to_delete.php", r_io.write)
+                        except (ConnectionError, OSError):
+                            conn = self._ensure_connection(None, profile)
+                            try:
+                                r_io = io.BytesIO()
+                                conn.retrbinary(f"RETR {path}/to_delete.php", r_io.write)
+                            except Exception:
+                                pass
                         content = r_io.getvalue().decode("utf-8", errors="ignore")
                     else:
                         with conn.open(f"{path}/to_delete.php", "r") as f:
@@ -1371,7 +1410,15 @@ class HealthCheckPage(QWidget):
                     content = ""
                     if isinstance(conn, ftplib.FTP):
                         r_io = io.BytesIO()
-                        conn.retrbinary(f"RETR {path}/updated_files.txt", r_io.write)
+                        try:
+                            conn.retrbinary(f"RETR {path}/updated_files.txt", r_io.write)
+                        except (ConnectionError, OSError):
+                            conn = self._ensure_connection(None, profile)
+                            try:
+                                r_io = io.BytesIO()
+                                conn.retrbinary(f"RETR {path}/updated_files.txt", r_io.write)
+                            except Exception:
+                                pass
                         content = r_io.getvalue().decode("utf-8", errors="ignore")
                     else:
                         with conn.open(f"{path}/updated_files.txt", "r") as f:
@@ -1380,7 +1427,7 @@ class HealthCheckPage(QWidget):
                     for line in content.splitlines():
                         if line.strip():
                             added_map[line.strip()] = v_tuple
-                except:
+                except Exception:
                     pass
 
             # 3. Konfliktauflösung
@@ -1482,6 +1529,19 @@ class HealthCheckPage(QWidget):
                                         exists = True
                                 except ftplib.error_perm:
                                     pass  # Existiert wirklich nicht
+                            except (ConnectionError, OSError):
+                                # Reconnect bei Server-Disconnect
+                                conn = self._ensure_connection(None, profile)
+                                try:
+                                    conn.size(file_path)
+                                    exists = True
+                                except ftplib.error_perm:
+                                    try:
+                                        result = conn.nlst(file_path)
+                                        if result is not None:
+                                            exists = True
+                                    except ftplib.error_perm:
+                                        pass
                         else:
                             try:
                                 conn.stat(file_path)
@@ -1517,8 +1577,8 @@ class HealthCheckPage(QWidget):
 
         except Exception as e:
             if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
-                log(f"Fehler bei Delete-Analyse: {str(e)}", "error")
-            return []
+                log(f"Hinweis bei Delete-Analyse: {str(e)}", "warn")
+            return legacy_found
 
     def _delete_legacy_files(self):
         """Initialisiert den Löschvorgang für die gefundenen Dateien."""
@@ -1772,22 +1832,58 @@ class HealthCheckPage(QWidget):
 
         # No cancellation check here, as connection is a single blocking call
         try:
-            protocol = profile.get("protocol")
-            host = profile.get("host")
-            port = int(profile.get("port", 21))
-            user = profile.get("username")
-            pwd = profile.get("password")
-            r_path = profile.get("remote_path", "").strip()
+            protocol = profile.get("protocol", "FTP")
+            raw_host = str(profile.get("host", "")).strip()
+            host = re.sub(r"^[a-zA-Z]+://", "", raw_host).strip("/")
+
+            raw_port = profile.get("port")
+            try:
+                port = int(raw_port)
+                if port <= 0:
+                    port = 22 if protocol == "SFTP" else 21
+            except (ValueError, TypeError):
+                port = 22 if protocol == "SFTP" else 21
+
+            user = str(profile.get("username", "")).strip()
+            pwd = profile.get("password", "")
+            r_path = str(profile.get("remote_path", "")).strip()
+            timeout = int(profile.get("timeout", 10))
+
+            self._emit_progress(f"Verbinde zu {host}:{port} ({protocol})...")
+            log(f"Starte Verbindung zu {host}:{port} über {protocol}...")
 
             files = []
             if protocol == "FTP":
-                ftp = ftplib.FTP()
-                ftp.connect(host, port, timeout=10)
+                log(f"Verbinde via FTP mit {host}:{port}...")
+                use_tls = False
+                ftp_timeout = int(profile.get("timeout", 25))
+                try:
+                    ftp = ftplib.FTP_TLS()
+                    ftp.connect(host, port, timeout=ftp_timeout)
+                    ftp.auth()
+                    use_tls = True
+                    log("Explizites TLS aktiviert (FTPS).")
+                except Exception:
+                    ftp = ftplib.FTP()
+                    ftp.connect(host, port, timeout=ftp_timeout)
+                    log("Verbinde über Standard-FTP (ohne TLS)...")
+
+                ftp.trust_server_pasv_ipv4_address = True
+                log(f"Netzwerkverbindung zu {host}:{port} hergestellt. Authentifiziere...")
                 ftp.login(user, pwd)
+                if use_tls:
+                    try:
+                        ftp.prot_p()  # TLS für den Datenkanal (nlst, retr, etc.)
+                        log("TLS-Schutz für Datenverbindung aktiviert (PROT P).")
+                    except Exception:
+                        pass
+                log(f"FTP-Login als '{user}' erfolgreich.")
                 if r_path:
                     ftp.cwd(r_path)
+                    log(f"FTP-Verzeichnis gewechselt zu '{r_path}'.")
+                log("Lese Verzeichnisinhalt...")
                 files = ftp.nlst()  # This can be slow for large directories
-                log("FTP-Verbindung erfolgreich hergestellt.")
+                log(f"FTP-Verbindung erfolgreich hergestellt ({len(files)} Einträge gefunden).")
                 return ftp, files
 
             elif protocol == "SFTP":
@@ -1796,18 +1892,21 @@ class HealthCheckPage(QWidget):
                     return None, []
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(host, port, user, pwd, timeout=10)
+                ssh.connect(host, port, user, pwd, timeout=timeout)
+                log(f"SSH-Verbindung zu {host}:{port} hergestellt. Öffne SFTP-Kanal...")
                 sftp = ssh.open_sftp()
                 if r_path:
                     sftp.chdir(r_path)  # Change directory first
+                    log(f"SFTP-Verzeichnis gewechselt zu '{r_path}'.")
                 files = sftp.listdir()  # Then list files
-                log("SFTP-Verbindung erfolgreich hergestellt.")
+                log(f"SFTP-Verbindung erfolgreich hergestellt ({len(files)} Einträge gefunden).")
                 return sftp, files
 
             log(f"Protokoll {protocol} wird für Dateiprüfung nicht unterstützt.", "warn")
             return None, []
         except Exception as e:  # Catch all exceptions for connection
-            log(f"Verbindungsfehler: {str(e)}", "error")
+            err_type = type(e).__name__
+            log(f"Verbindungsfehler [{protocol}://{host}:{port}] ({err_type}): {str(e)}", "error")
             return None, []
 
     def _check_gambio_structure(self, files, signal=None):
@@ -2126,7 +2225,7 @@ class HealthCheckPage(QWidget):
 
                     if self.worker._is_cancelled:
                         return {}  # Check after sleep
-                    response = requests.get(full_http_url, timeout=10, verify=False)
+                    response = requests.get(full_http_url, timeout=10, verify=True)
 
                     if response.status_code == 200:
                         try:
@@ -3204,8 +3303,16 @@ class ConfigPage(QWidget):
         self.edit_username = QLineEdit()
         self.edit_password = QLineEdit()
         self.edit_password.setEchoMode(QLineEdit.Password)
+        self.btn_toggle_password = QPushButton("Anzeigen")
+        self.btn_toggle_password.setFixedWidth(80)
+        self.btn_toggle_password.clicked.connect(self._toggle_password_visibility)
+        password_layout = QHBoxLayout()
+        password_layout.addWidget(self.edit_password)
+        password_layout.addWidget(self.btn_toggle_password)
+
         self.combo_protocol = QComboBox()
         self.combo_protocol.addItems(["FTP", "SFTP", "HTTPS"])
+        self.combo_protocol.currentTextChanged.connect(self._on_protocol_changed)
         self.edit_shop_url = QLineEdit()
         self.remote_path_input = QLineEdit()
 
@@ -3213,7 +3320,7 @@ class ConfigPage(QWidget):
         profile_form_layout.addRow("Host:", self.edit_host)
         profile_form_layout.addRow("Port:", self.edit_port)
         profile_form_layout.addRow("Benutzername:", self.edit_username)
-        profile_form_layout.addRow("Passwort:", self.edit_password)
+        profile_form_layout.addRow("Passwort:", password_layout)
         profile_form_layout.addRow("Protokoll:", self.combo_protocol)
         profile_form_layout.addRow("Shop-URL (HTTPS):", self.edit_shop_url)
         profile_form_layout.addRow("Shop-Pfad (Server):", self.remote_path_input)
@@ -3361,18 +3468,31 @@ class ConfigPage(QWidget):
 
     def _get_current_profile_data(self) -> dict:
         """Sammelt die Daten aus den Eingabefeldern und gibt sie als Diktat zurück."""
-        port_text = self.edit_port.text()
-        port = int(port_text) if port_text.isdigit() else 0  # Standardwert 0 oder Fehlerbehandlung
+        port_text = self.edit_port.text().strip()
+        protocol = self.combo_protocol.currentText()
+        if port_text.isdigit() and int(port_text) > 0:
+            port = int(port_text)
+        else:
+            port = 22 if protocol == "SFTP" else 21
         return {
-            "shop_name": self.edit_shop_name.text(),
-            "host": self.edit_host.text(),
+            "shop_name": self.edit_shop_name.text().strip(),
+            "host": self.edit_host.text().strip(),
             "port": port,
-            "username": self.edit_username.text(),
+            "username": self.edit_username.text().strip(),
             "password": self.edit_password.text(),
-            "protocol": self.combo_protocol.currentText(),
-            "shop_url": self.edit_shop_url.text(),
-            "remote_path": self.remote_path_input.text(),
+            "protocol": protocol,
+            "shop_url": self.edit_shop_url.text().strip(),
+            "remote_path": self.remote_path_input.text().strip(),
         }
+
+    def _toggle_password_visibility(self):
+        """Schaltet die Anzeige des Passworts zwischen Klartext und Maskierung um."""
+        if self.edit_password.echoMode() == QLineEdit.Password:
+            self.edit_password.setEchoMode(QLineEdit.Normal)
+            self.btn_toggle_password.setText("Verbergen")
+        else:
+            self.edit_password.setEchoMode(QLineEdit.Password)
+            self.btn_toggle_password.setText("Anzeigen")
 
     def _set_profile_data(self, profile_data: dict):
         """Setzt die Daten in die Eingabefelder."""
@@ -3381,6 +3501,8 @@ class ConfigPage(QWidget):
         self.edit_port.setText(str(profile_data.get("port", "")))
         self.edit_username.setText(profile_data.get("username", ""))
         self.edit_password.setText(profile_data.get("password", ""))
+        self.edit_password.setEchoMode(QLineEdit.Password)
+        self.btn_toggle_password.setText("Anzeigen")
         self.combo_protocol.setCurrentText(profile_data.get("protocol", "FTP"))
         self.edit_shop_url.setText(profile_data.get("shop_url", ""))
         self.remote_path_input.setText(profile_data.get("remote_path", ""))
@@ -3392,10 +3514,20 @@ class ConfigPage(QWidget):
         self.edit_port.clear()
         self.edit_username.clear()
         self.edit_password.clear()
+        self.edit_password.setEchoMode(QLineEdit.Password)
+        self.btn_toggle_password.setText("Anzeigen")
         self.combo_protocol.setCurrentIndex(0)  # Auf FTP zurücksetzen
         self.edit_shop_url.clear()
         self.remote_path_input.clear()
         self.current_profile_index = -1
+
+    def _on_protocol_changed(self, protocol_name: str):
+        """Passt den Standard-Port automatisch an, wenn das Protokoll gewechselt wird."""
+        current_port = self.edit_port.text().strip()
+        if protocol_name == "FTP" and current_port in ["22", "", "0"]:
+            self.edit_port.setText("21")
+        elif protocol_name == "SFTP" and current_port in ["21", "", "0"]:
+            self.edit_port.setText("22")
 
     def _test_connection(self):
         """Prüft die FTP/SFTP-Verbindung und sucht nach Gambio-Indikatoren."""
@@ -3403,12 +3535,21 @@ class ConfigPage(QWidget):
             self.auth_manager.require_active_session()
             data = self._get_current_profile_data()
 
-            protocol = data["protocol"]
-            host = data["host"]
-            port = data["port"]
-            user = data["username"]
-            pwd = data["password"]
-            remote_path = data["remote_path"].strip()
+            protocol = data.get("protocol", "FTP")
+            raw_host = str(data.get("host", "")).strip()
+            host = re.sub(r"^[a-zA-Z]+://", "", raw_host).strip("/")
+
+            raw_port = data.get("port")
+            try:
+                port = int(raw_port)
+                if port <= 0:
+                    port = 22 if protocol == "SFTP" else 21
+            except (ValueError, TypeError):
+                port = 22 if protocol == "SFTP" else 21
+
+            user = str(data.get("username", "")).strip()
+            pwd = data.get("password", "")
+            remote_path = data.get("remote_path", "").strip()
 
             if not host or not user:
                 show_error("Bitte Host und Benutzername ausfüllen.")
@@ -3426,9 +3567,24 @@ class ConfigPage(QWidget):
             version_info = ""
 
             if protocol == "FTP":
-                with ftplib.FTP() as ftp:
-                    ftp.connect(host, port, timeout=10)
+                use_tls = False
+                try:
+                    ftp = ftplib.FTP_TLS()
+                    ftp.connect(host, port, timeout=15)
+                    ftp.auth()
+                    use_tls = True
+                except Exception:
+                    ftp = ftplib.FTP()
+                    ftp.connect(host, port, timeout=15)
+
+                try:
+                    ftp.trust_server_pasv_ipv4_address = True
                     ftp.login(user, pwd)
+                    if use_tls:
+                        try:
+                            ftp.prot_p()
+                        except Exception:
+                            pass
                     if remote_path:
                         ftp.cwd(remote_path)
                     found_files = ftp.nlst()
@@ -3441,8 +3597,16 @@ class ConfigPage(QWidget):
                         match = re.search(r"'PROJECT_VERSION'\s*=>\s*'([^']+)'", content)
                         if match:
                             version_info = f"\nErkannte Version: {match.group(1)}"
-                    except:
+                    except Exception:
                         pass
+                finally:
+                    try:
+                        ftp.quit()
+                    except Exception:
+                        try:
+                            ftp.close()
+                        except Exception:
+                            pass
 
             elif protocol == "SFTP":
                 if paramiko is None:
@@ -3451,7 +3615,7 @@ class ConfigPage(QWidget):
 
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(host, port, user, pwd, timeout=10)
+                ssh.connect(host, port, user, pwd, timeout=15)
                 sftp = ssh.open_sftp()
                 if remote_path:
                     sftp.chdir(remote_path)
@@ -3464,7 +3628,7 @@ class ConfigPage(QWidget):
                         match = re.search(r"'PROJECT_VERSION'\s*=>\s*'([^']+)'", content)
                         if match:
                             version_info = f"\nErkannte Version: {match.group(1)}"
-                except:
+                except Exception:
                     pass
                 sftp.close()
                 ssh.close()
@@ -3479,37 +3643,36 @@ class ConfigPage(QWidget):
             ]
             shop_detected = any(ind in found_files for ind in gambio_indicators)
 
-            # Zusätzlicher Check auf spezifische Files, falls nlst/listdir nur Namen lieferte
-            if not shop_detected:
-                # Manchmal liefert nlst/listdir nicht alles oder Pfade sind komplex
-                critical_files = ["system/conf/main.conf.php", "GXEngine/Shop.php"]
-                # (Hier vereinfacht über die bereits geholte Liste)
-
             if shop_detected:
                 QMessageBox.information(
                     self,
                     "Erfolg",
-                    f"Verbindung erfolgreich.{version_info}\nGambio-Shop wurde im Pfad erkannt.",
+                    f"Verbindung erfolgreich ({protocol}://{host}:{port}).{version_info}\nGambio-Shop wurde im Pfad erkannt.",
                 )
             else:
                 show_error(
-                    "Verbindung erfolgreich, aber im angegebenen Ordner wurde kein Gambio-Shop gefunden.\n"
+                    f"Verbindung zu {protocol}://{host}:{port} erfolgreich, aber im angegebenen Ordner '{remote_path}' wurde kein Gambio-Shop gefunden.\n"
                     "Bitte prüfen Sie den Shop-Pfad (Server)."
                 )
 
         except SessionExpiredError as e:
             show_error(str(e))
         except ftplib.all_errors as e:
-            show_error(f"FTP-Verbindung fehlgeschlagen: {str(e)}")
+            show_error(f"FTP-Verbindung zu {host}:{port} fehlgeschlagen:\n{str(e)}")
         except Exception as e:
-            # Fehlerbehandlung für SFTP (paramiko wirft diverse SSHExceptions)
             err_msg = str(e)
             if "Authentication failed" in err_msg:
-                show_error("FTP-Verbindung fehlgeschlagen: Login falsch.")
-            elif "Connection timed out" in err_msg:
-                show_error("FTP-Verbindung fehlgeschlagen: Host nicht erreichbar (Timeout).")
+                show_error(f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\nLogin/Passwort falsch.")
+            elif "Connection timed out" in err_msg or "timed out" in err_msg:
+                show_error(
+                    f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\nHost nicht erreichbar (Timeout). Bitte Port ({port}) und Firewall prüfen."
+                )
+            elif "Error reading SSH protocol banner" in err_msg:
+                show_error(
+                    f"SFTP-Verbindung zu {host}:{port} fehlgeschlagen:\nDer Server lieferte kein SSH-Protokollbanner. Möglicherweise läuft auf Port {port} normales FTP statt SFTP."
+                )
             else:
-                show_error(f"FTP-Verbindung fehlgeschlagen: {err_msg}")
+                show_error(f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\n{err_msg}")
         finally:
             self.auth_manager.update_activity()
 
@@ -3821,9 +3984,7 @@ class MainWindow(QMainWindow):
         bottom_bar.addStretch()
 
         # Copyright & Link (Right)
-        from datetime import datetime
-
-        current_year = datetime.now().year
+        current_year = datetime.datetime.now(datetime.timezone.utc).year
         copyright_label = QLabel(
             f"© {current_year} <a href='https://www.agentur-schoelzke.de' style='color: gray; text-decoration: none;'>Agentur Schölzke</a>"
         )

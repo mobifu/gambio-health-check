@@ -1,0 +1,159 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# ==============================================================================
+# PROJEKT-METADATEN (Projektspezifisch anpassen)
+# ==============================================================================
+[project]
+name = "mein-projekt"
+version = "0.1.0"
+description = "Beschreibung des Projekts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Deine Laufzeit-Abhängigkeiten (z.B. cryptography, requests, etc.)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.10",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "bandit>=1.7",
+]
+
+# ==============================================================================
+# RUFF (Linter & Formatter)
+# ==============================================================================
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# E, W: Pycodestyle, F: Pyflakes, B: Bugbear, I: isort
+# S: flake8-bandit (Security), UP: pyupgrade (modernes Python)
+select = ["E", "W", "F", "B", "I", "S", "UP"]
+ignore = [
+    "E501", # Zeilenlänge übernimmt der Formatter
+    "S101", # Erlaubt assert (z. B. für Pytest)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# In Tests sind Hardcoded Testdaten/Secrets und Temp-Pfade legitim
+"tests/**/*" = ["S105", "S106", "S107", "S108"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+# ==============================================================================
+# PYTEST (Test-Runner)
+# ==============================================================================
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "__pycache__",
+]
+
+# ==============================================================================
+# COVERAGE (Testabdeckung)
+# ==============================================================================
+[tool.coverage.run]
+branch = true
+omit = [
+    "tests/*",
+    "venv/*",
+    ".venv/*",
+    "build/*",
+    "dist/*",
+]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+# ==============================================================================
+# MYPY (Strenge statische Typisierung)
+# ==============================================================================
+[tool.mypy]
+python_version = "3.10"
+explicit_package_bases = true
+follow_imports = "silent"
+
+# Strikte Typisierungsregeln
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_configs = true
+show_error_codes = true
+
+# Ignoriere Caches und Builds beim rekursiven Scan
+exclude = [
+    "^\\.venv/",
+    "^venv/",
+    "^build/",
+    "^dist/",
+]
+
+# Drittanbieter-Module ohne eigene Typstubs hier auflisten
+[[tool.mypy.overrides]]
+module = [
+    "customtkinter.*",
+    "paramiko.*",
+    "schedule.*",
+    "setuptools.*",
+    "Cython.*",
+]
+ignore_missing_imports = true
+
+# ==============================================================================
+# BANDIT (Sicherheits-Scan)
+# ==============================================================================
+[tool.bandit]
+exclude_dirs = [
+    ".venv",
+    "venv",
+    "tests",
+    "build",
+    "dist",
+]
+skips = ["B101"] # B101 = Assert-Nutzung
