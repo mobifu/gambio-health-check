@@ -46,7 +46,7 @@ class SessionLock:
 
     def is_expired(self) -> bool:
         """Prüft, ob der Inaktivitätszeitraum überschritten wurde."""
-        return self._get_elapsed() > self.timeout
+        return self._get_elapsed() >= self.timeout
 
     def remaining_seconds(self) -> float:
         """Gibt die verbleibende Session-Gültigkeit in Sekunden zurück (mindestens 0.0)."""

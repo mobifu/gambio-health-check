@@ -1,5 +1,5 @@
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -52,6 +52,7 @@ def test_too_many_attempts(monkeypatch):
 def test_session_lock_expiration(monkeypatch):
     # Session mit 0 Minuten Timeout für sofortigen Ablauf
     lock = SessionLock(timeout_minutes=0)
+    lock.last_activity = datetime.now(timezone.utc) - timedelta(seconds=1)
     assert lock.is_expired() is True
 
     with pytest.raises(SessionExpiredError):
@@ -80,7 +81,8 @@ def test_session_expired_clears_password():
     manager = MasterPasswordManager()
     manager.set_password("mypassword")
 
-    # Simuliere Inaktivität (Timeout auf 0 setzen)
+    # Simuliere Inaktivität (Timeout auf 0 setzen und Inaktivitätszeitpunkt in Vergangenheit)
+    manager._session_lock.last_activity = datetime.now(timezone.utc) - timedelta(seconds=1)
     manager._session_lock.timeout = timedelta(minutes=0)
 
     assert manager.is_session_expired() is True
