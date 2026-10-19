@@ -1,6 +1,8 @@
-import pytest
 import ftplib
 from unittest.mock import MagicMock
+
+import pytest
+
 from ui.main_window import BakFileScannerWorker
 
 

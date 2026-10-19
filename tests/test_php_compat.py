@@ -1,7 +1,6 @@
-import unittest
 import os
 import sys
-
+import unittest
 
 # Füge das Hauptverzeichnis zum PYTHONPATH hinzu, damit wir ui importieren können
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -56,7 +55,6 @@ class TestPHPCompatLogic(unittest.TestCase):
         # Wir können das prüfen, wenn wir den log checken. Da wir hier nur DummySignal haben,
         # prüfen wir ob self.results leer ist (da wir signal=self.signal mitgegeben haben,
         # sollte es an signal.emit gehen, aber log_add_result nicht aufrufen. Wait, wir machen self.signal zu etwas, das speichert)
-        pass
 
     def test_version_logic(self):
         # Hilfsfunktion, die wir testen können, ohne dass UI Signale triggern

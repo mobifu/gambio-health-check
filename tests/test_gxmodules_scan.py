@@ -1,7 +1,7 @@
-import unittest
+import ftplib
 import os
 import sys
-import ftplib
+import unittest
 from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -54,7 +54,7 @@ class TestGXModulesScan(unittest.TestCase):
         def mock_mlsd(path):
             rel_path = path.replace("GXModules", "").strip("/")
             items = {}
-            for fname in files_dict.keys():
+            for fname in files_dict:
                 if rel_path:
                     if fname.startswith(rel_path + "/"):
                         sub_path = fname[len(rel_path) + 1 :]
@@ -177,7 +177,7 @@ class TestGXModulesScan(unittest.TestCase):
         """
         import sys
         import types
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import MagicMock, patch
 
         # Simuliere phply-Import, aber mit lexer=None
         mock_phplex = types.ModuleType("phplex")

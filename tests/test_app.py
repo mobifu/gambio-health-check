@@ -1,8 +1,10 @@
-import pytest
-from unittest.mock import patch, MagicMock
 from pathlib import Path
-from security.exceptions import InvalidMasterPasswordError
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 import app
+from security.exceptions import InvalidMasterPasswordError
 
 
 def test_is_initial_setup(tmp_path):

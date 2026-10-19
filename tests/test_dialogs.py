@@ -1,12 +1,15 @@
-import pytest
 from unittest.mock import patch
-from ui.dialogs import MasterPasswordDialog, ShopProfileDialog, show_error
+
+import pytest
 from PySide6.QtWidgets import QMessageBox
+
+from ui.dialogs import MasterPasswordDialog, ShopProfileDialog, show_error
 
 
 @pytest.fixture(scope="module")
 def qapp():
     import sys
+
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance()
@@ -154,8 +157,9 @@ def test_master_password_empty_validation(qapp):
 
 
 def test_show_info_and_confirmation(qapp):
-    from ui.dialogs import show_info, ask_confirmation
     from PySide6.QtWidgets import QMessageBox
+
+    from ui.dialogs import ask_confirmation, show_info
 
     with patch.object(QMessageBox, "information") as mock_info:
         show_info("Nachricht", title="Titel")

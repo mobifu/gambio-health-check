@@ -1,19 +1,19 @@
-import ftplib
-import time
-import stat
-import re
+import configparser
+import datetime
 import fnmatch
+import ftplib  # nosec B402 # Wird für Typ- und Fehlerprüfungen benötigt
 import io
-import os
-import platform
-import subprocess
 import json
 import logging
-import configparser
+import os
+import platform
+import re
 import secrets
-import datetime
+import stat
+import subprocess
+import time
 from pathlib import Path
-from typing import Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 try:
     import requests  # type: ignore
@@ -24,44 +24,53 @@ try:
 except ImportError:
     paramiko = None
 
+from PySide6.QtCore import Qt, QThread, Signal  # Added QSize for QMovie scaling
+from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QHBoxLayout,
-    QVBoxLayout,
-    QPushButton,
-    QStackedWidget,
-    QLabel,
-    QGroupBox,
-    QFormLayout,
-    QLineEdit,
-    QComboBox,
-    QMessageBox,
-    QScrollArea,
-    QFrame,
-    QTextBrowser,
-    QProgressBar,
     QCheckBox,
-    QSpinBox,
+    QComboBox,
     QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStackedWidget,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, Signal, QThread  # Added QSize for QMovie scaling
-from ui.dialogs import MasterPasswordDialog, show_error
+
+from config.config_manager import ConfigManager
+from core.hash_engine import HashCheckEngine
+from core.logger import HealthCheckLogger
+from core.reporting import generate_html_report, generate_pdf_report
 from security.exceptions import (
     InvalidMasterPasswordError,
-    TooManyFailedAttemptsError,
     SessionExpiredError,
+    TooManyFailedAttemptsError,
 )
 from security.master_password import MasterPasswordManager
-from config.config_manager import ConfigManager
-from core.logger import HealthCheckLogger
-from core.hash_engine import HashCheckEngine
-from core.reporting import generate_html_report, generate_pdf_report
+from ui.dialogs import MasterPasswordDialog, show_error
+from ui.network_service import NetworkService
+from ui.workers import (
+    BakFileScannerWorker,
+    HealthCheckWorker,
+    LegacyDeleteWorker,
+    LogfileWorker,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def open_path(path: Union[str, Path]) -> None:
+def open_path(path: str | Path) -> None:
     """Öffnet einen Pfad oder eine Datei im systemstandard-Explorer/App."""
     resolved_path = Path(path).resolve()
     if not resolved_path.exists():
@@ -77,768 +86,9 @@ def open_path(path: Union[str, Path]) -> None:
         logger.error(f"Fehler beim Öffnen von {resolved_path}: {e}")
 
 
-class HealthCheckWorker(QThread):
-    """
-    Worker-Thread für den Health-Check, um die GUI während
-    der Netzwerkoperationen reaktionsfähig zu halten.
-    """
-
-    result_signal = Signal(str, str)  # (Nachricht, Status)
-    legacy_files_signal = Signal(list)  # Liste der gefundenen Altlasten
-    progress_signal = Signal(str)  # Für den Status-Text
-    cancelled_signal = Signal()  # Signal, wenn der Worker abgebrochen wurde
-    finished_signal = Signal()
-
-    def __init__(self, page_instance, profile, logger_instance, mode="full", scan_gambio=False):
-        super().__init__()
-        self.page = page_instance
-        self.profile = profile
-        self.logger = logger_instance
-        self.mode = mode
-        self.scan_gambio = scan_gambio
-        self._is_cancelled = False  # Flag, um den Abbruch zu signalisieren
-
-    def cancel(self):
-        """Setzt das Abbruch-Flag und sendet ein Signal."""
-        self._is_cancelled = True
-        self.cancelled_signal.emit()
-
-    def run(self):
-        conn = None
-        self.logger.start_session()
-        self.progress_signal.emit(f"Starte Prüfung für: {self.profile.get('shop_name')}")
-        try:
-            if self._is_cancelled:
-                return  # Sofortiger Abbruch
-
-            # 1. Verbindungstest
-            self.progress_signal.emit("Prüfe Verbindung...")
-            conn, remote_files = self.page._check_connection(self.profile, self.result_signal)
-            if not conn:
-                return
-
-            # Hash-Engine Initialisierung
-            hash_engine = HashCheckEngine(
-                self.profile.get("shop_name"),
-                conn,
-                self.result_signal,
-                self.logger,
-                self,
-            )
-
-            if self.mode == "baseline":
-                hash_engine.generate_baseline()
-                return
-
-            if self.mode == "hash_check":
-                hash_engine.compare_with_baseline()
-                # Falls eine Version bekannt ist, auch Update-Hashes prüfen
-                g_ver = self.page._check_version(conn, self.profile)
-                if g_ver:
-                    hash_engine.compare_with_update_hashes(g_ver)
-                return
-
-            # --- Standard Full Health Check ---
-
-            # 2. Gambio Erkennung
-            if self._is_cancelled:
-                return
-            is_gambio = self.page._check_gambio_structure(remote_files, self.result_signal)
-
-            # Cache Prüfung
-            if is_gambio and not self._is_cancelled:
-                self.progress_signal.emit("Prüfe Cache-Größe...")
-                self.page._check_cache_size(conn, remote_files, self.result_signal)
-            if not is_gambio:
-                self.progress_signal.emit("Keine eindeutige Gambio-Struktur gefunden.")
-                self.result_signal.emit("Keine eindeutige Gambio-Struktur im Verzeichnis gefunden.", "error")
-                return  # Stop if no gambio structure
-
-            # 4. Schreibrechte
-            if self._is_cancelled:
-                return
-            self.progress_signal.emit("Prüfe Schreibrechte...")
-            self.page._check_write_permissions(conn, self.profile, self.result_signal)
-
-            # 5. PHP & MySQL Versionen (HTTP via JSON)
-            if self._is_cancelled:
-                return
-            self.progress_signal.emit("Ermittle PHP- und Datenbank-Versionen...")
-            versions = self.page._check_php_version_via_ftp_http(conn, self.profile, self.result_signal)
-            if self._is_cancelled:
-                return  # Nach HTTP-Abfrage erneut prüfen
-            php_ver = versions.get("php")  # This should be clean from phpversion()
-            db_info = versions.get("db", {})
-            db_type = db_info.get("type")
-            mysql_ver_full = db_info.get("version_full")
-            mysql_ver = db_info.get("version_number")  # This is already clean
-            self.progress_signal.emit(f"PHP: {php_ver}, DB: {db_type} {mysql_ver_full}")
-
-            # Erweiterte Sicherheits- und Umgebungschecks auswerten
-            security_info = versions.get("security", {})
-            env_info = versions.get("env", {})
-
-            if security_info.get("installer_exists"):
-                self.result_signal.emit(
-                    "Sicherheitsrisiko: Verzeichnis 'gambio_installer' existiert noch!",
-                    "error",
-                )
-            else:
-                self.result_signal.emit("Installationsverzeichnis (gambio_installer) ist gelöscht.", "ok")
-
-            if security_info.get("config_writable"):
-                self.result_signal.emit(
-                    "Sicherheitsrisiko: includes/configure.php ist beschreibbar!",
-                    "warn",
-                )
-            else:
-                self.result_signal.emit("includes/configure.php ist korrekt schreibgeschützt.", "ok")
-
-            if security_info.get("admin_config_writable"):
-                self.result_signal.emit(
-                    "Sicherheitsrisiko: admin/includes/configure.php ist beschreibbar!",
-                    "warn",
-                )
-            else:
-                self.result_signal.emit("admin/includes/configure.php ist korrekt schreibgeschützt.", "ok")
-
-            if security_info.get("htaccess_admin_backups") is False:
-                self.result_signal.emit(
-                    "Sicherheitsrisiko: admin/backups/.htaccess fehlt (Backups könnten öffentlich zugänglich sein)!",
-                    "error",
-                )
-            elif security_info.get("htaccess_admin_backups") is True:
-                self.result_signal.emit("Verzeichnis admin/backups/ ist durch .htaccess geschützt.", "ok")
-
-            if security_info.get("htaccess_log") is False:
-                self.result_signal.emit(
-                    "Sicherheitsrisiko: logfiles/.htaccess fehlt (Logs könnten öffentlich zugänglich sein)!",
-                    "warn",
-                )
-            elif security_info.get("htaccess_log") is True:
-                self.result_signal.emit("Verzeichnis logfiles/ ist durch .htaccess geschützt.", "ok")
-
-            if env_info.get("session_auto_start"):
-                self.result_signal.emit(
-                    "Server-Konfiguration: session.auto_start ist aktiv (sollte deaktiviert sein).",
-                    "warn",
-                )
-
-            if env_info.get("soap_loaded") is False:
-                self.result_signal.emit("Fehlende PHP-Erweiterung: 'soap' ist nicht geladen.", "error")
-            if env_info.get("intl_loaded") is False:
-                self.result_signal.emit("Fehlende PHP-Erweiterung: 'intl' ist nicht geladen.", "error")
-
-            # 6. Versionsprüfung
-            if self._is_cancelled:
-                return
-            self.progress_signal.emit("Ermittle Gambio-Version...")
-            gambio_ver = self.page._check_version(conn, self.profile, self.result_signal)
-
-            # 7. PHP-Kompatibilitätsprüfung
-            if php_ver and gambio_ver:
-                self.progress_signal.emit("Lese Kompatibilitätsdaten aus Shop...")
-                min_php, max_php = self.page._get_php_compat_from_shop(conn, gambio_ver, self.result_signal)
-                self.progress_signal.emit("Prüfe PHP-Kompatibilität...")
-                self.page._run_php_compatibility_check_logic(gambio_ver, php_ver, min_php, max_php, self.result_signal)
-            if self._is_cancelled:
-                return
-
-            # Integrität
-            if self._is_cancelled:
-                return
-            self.progress_signal.emit("Prüfe Shop-Integrität...")
-            self.page._check_integrity(remote_files, self.result_signal)
-
-            # 8. Update-Analyse Engine
-            if self._is_cancelled:
-                return
-            # if gambio_ver:
-            #     self.page._run_update_analysis_logic(conn, gambio_ver, php_ver, mysql_ver, db_type, remote_files, self.result_signal)
-            # else:
-            #     self.result_signal.emit("Update-Analyse übersprungen (Gambio-Version unbekannt).", "warn")
-            #     self.progress_signal.emit("Update-Analyse übersprungen.")
-
-            # GXModules Plugin Kompatibilitäts-Scan
-            if self._is_cancelled:
-                return
-            self.page._run_gxmodules_compatibility_scan(conn, gambio_ver, self.scan_gambio, self.result_signal)
-
-            # 9. Detaillierte Delete-Analyse (Altlasten)
-            if self._is_cancelled:
-                return
-            self.progress_signal.emit("Analysiere Altlasten...")
-            legacy_files = self.page._run_legacy_delete_analysis_logic(conn, self.result_signal, profile=self.profile)
-            self.legacy_files_signal.emit(legacy_files)
-
-        except Exception as e:
-            self.progress_signal.emit(f"Fehler: {str(e)}")
-            logger.error(f"Health-Check Worker Fehler: {e}")
-            self.result_signal.emit(f"Unerwarteter Fehler: {str(e)}", "error")
-        # No matter what, if cancelled, emit a specific message
-        finally:
-            self.logger.end_session()
-            if conn:
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        conn.quit()
-                    else:
-                        conn.close()
-                except:
-                    pass
-            self.finished_signal.emit()
-            if self._is_cancelled:
-                self.result_signal.emit("Health-Check abgebrochen.", "warn")
-
-
-class LegacyDeleteWorker(QThread):
-    """
-    Worker-Thread zum Löschen von Altlasten oder .bak Dateien.
-    """
-
-    result_signal = Signal(str, str)
-    finished_signal = Signal()
-    progress_signal = Signal(str)
-
-    def __init__(
-        self,
-        page_instance,
-        profile,
-        files_to_delete,
-        logger_instance=None,
-        clear_cache=False,
-    ):
-        super().__init__()
-        self.page = page_instance
-        self.profile = profile
-        self.files = files_to_delete
-        self.logger = logger_instance
-        self.clear_cache = clear_cache
-
-    def run(self):
-        conn = None
-        try:
-            self.progress_signal.emit("Verbinde zum Server für Löschvorgang...")
-            conn, _ = self.page._check_connection(self.profile, self.result_signal)
-            if not conn:
-                self.progress_signal.emit("Verbindung für Löschvorgang fehlgeschlagen.")
-                return
-
-            def rmtree_ftp(ftp_conn, path):
-                """Löscht ein FTP-Verzeichnis rekursiv."""
-                try:
-                    # Versuche alle Dateien/Unterordner aufzulisten
-                    # "-a" zeigt auch versteckte Dateien auf vielen FTP-Servern
-                    try:
-                        names = ftp_conn.nlst("-a", path)
-                        if not names:  # Fallback falls -a ignoriert wird
-                            names = ftp_conn.nlst(path)
-                    except Exception:
-                        names = ftp_conn.nlst(path)
-                except ftplib.error_perm:
-                    # Ordner ist leer oder existiert nicht
-                    names = []
-
-                for name in names:
-                    # ftp_conn.nlst() gibt manchmal relative oder absolute Pfade zurück.
-                    # Normalweisen, um Endlosschleifen zu vermeiden.
-                    base_name = name.rstrip("/").split("/")[-1].split("\\")[-1]
-                    if base_name in (".", ".."):
-                        continue
-
-                    # Pfad zusammensetzen
-                    full_p = name if name.startswith(path) else f"{path}/{name}"
-                    if full_p.rstrip("/") == path.rstrip("/"):
-                        continue
-
-                    try:
-                        # Versuche als Datei zu löschen
-                        ftp_conn.delete(full_p)
-                    except ftplib.error_perm:
-                        # Wenn Fehler, ist es vermutlich ein Ordner -> rekursiv löschen
-                        rmtree_ftp(ftp_conn, full_p)
-
-                # Am Ende den leeren Ordner löschen
-                ftp_conn.rmd(path)
-
-            def rmtree_sftp(sftp_conn, path):
-                """Löscht ein SFTP-Verzeichnis rekursiv."""
-                try:
-                    for entry in sftp_conn.listdir_attr(path):
-                        if entry.filename in (".", ".."):
-                            continue
-                        full_p = f"{path}/{entry.filename}"
-                        if stat.S_ISDIR(entry.st_mode):
-                            rmtree_sftp(sftp_conn, full_p)
-                        else:
-                            sftp_conn.remove(full_p)
-                    sftp_conn.rmdir(path)
-                except Exception:
-                    # Falls stat.S_ISDIR nicht klappt, versuchen wir es mit try-catch
-                    try:
-                        sftp_conn.remove(path)
-                    except Exception:
-                        sftp_conn.rmdir(path)
-
-            total = len(self.files)
-            for i, file_path in enumerate(self.files, 1):
-                try:
-                    # Prüfen ob Datei oder Ordner anhand des Vorhandenseins eines Punkts im letzten Pfadsegment
-                    last_part = file_path.split("/")[-1]
-                    is_folder = "." not in last_part
-
-                    if is_folder:
-                        self.progress_signal.emit(f"Lösche Ordner {i}/{total}: {file_path}")
-                        try:
-                            if isinstance(conn, ftplib.FTP):
-                                rmtree_ftp(conn, file_path)
-                            else:  # SFTP
-                                rmtree_sftp(conn, file_path)
-                            if self.logger:
-                                self.logger.info(f"Ordner erfolgreich gelöscht: {file_path}")
-                            self.result_signal.emit(f"Ordner gelöscht: {file_path}", "ok")
-                        except Exception as e:
-                            # Try as file (Fallback)
-                            try:
-                                if isinstance(conn, ftplib.FTP):
-                                    conn.delete(file_path)
-                                else:
-                                    conn.remove(file_path)
-                                if self.logger:
-                                    self.logger.info(f"Datei erfolgreich gelöscht (Fallback): {file_path}")
-                                self.result_signal.emit(f"Datei gelöscht: {file_path}", "ok")
-                            except Exception:
-                                raise e  # Raise original error if fallback fails
-                    else:
-                        self.progress_signal.emit(f"Lösche Datei {i}/{total}: {file_path}")
-                        try:
-                            if isinstance(conn, ftplib.FTP):
-                                conn.delete(file_path)
-                            else:  # SFTP
-                                conn.remove(file_path)
-                            if self.logger:
-                                self.logger.info(f"Datei erfolgreich gelöscht: {file_path}")
-                            self.result_signal.emit(f"Datei gelöscht: {file_path}", "ok")
-                        except Exception as e:
-                            # Try as folder (Fallback)
-                            try:
-                                if isinstance(conn, ftplib.FTP):
-                                    rmtree_ftp(conn, file_path)
-                                else:
-                                    rmtree_sftp(conn, file_path)
-                                if self.logger:
-                                    self.logger.info(f"Ordner erfolgreich gelöscht (Fallback): {file_path}")
-                                self.result_signal.emit(f"Ordner gelöscht: {file_path}", "ok")
-                            except Exception:
-                                raise e  # Raise original error if fallback fails
-                except Exception as e:
-                    entry_type = "Ordner" if is_folder else "Datei"
-                    if getattr(self, "logger", None):
-                        self.logger.error(f"Fehler beim Löschen von {entry_type} {file_path}: {str(e)}")
-                    self.result_signal.emit(
-                        f"Fehler beim Löschen von {entry_type} {file_path}: {str(e)}",
-                        "error",
-                    )
-
-            # Optionale automatische Cache-Bereinigung
-            if self.clear_cache:
-                self.progress_signal.emit("Bereinige System-Cache (Ordner 'cache')...")
-                cache_dir = "cache"
-                skipped_files = [".htaccess", "index.html", "index.php"]
-                deleted_cache_count = 0
-
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        try:
-                            # Wir listen den Cache Ordner auf
-                            items = conn.nlst(cache_dir)
-                            for item in items:
-                                # Normalisieren
-                                name = item if not item.startswith(cache_dir + "/") else item[len(cache_dir) + 1 :]
-                                if name in (".", "..") or not name:
-                                    continue
-                                if name in skipped_files:
-                                    continue
-
-                                full_item_path = f"{cache_dir}/{name}"
-                                try:
-                                    # Nur Dateien löschen (wenn es ein Ordner ist, wirft size() oder delete() in der Regel einen Perm Error)
-                                    conn.delete(full_item_path)
-                                    deleted_cache_count += 1
-                                except ftplib.error_perm:
-                                    pass  # Ordner im Cache-Verzeichnis unberührt lassen
-                        except Exception as ce:
-                            self.result_signal.emit(
-                                f"Hinweis: Konnte Cache-Ordner nicht vollständig auflisten/bereinigen: {str(ce)}",
-                                "warn",
-                            )
-                    else:  # SFTP
-                        try:
-                            for entry in conn.listdir_attr(cache_dir):
-                                if entry.filename in (".", ".."):
-                                    continue
-                                if entry.filename in skipped_files:
-                                    continue
-
-                                # Wenn es ein Verzeichnis ist, überspringen wir es
-                                if stat.S_ISDIR(entry.st_mode):
-                                    continue
-
-                                full_item_path = f"{cache_dir}/{entry.filename}"
-                                conn.remove(full_item_path)
-                                deleted_cache_count += 1
-                        except Exception as ce:
-                            self.result_signal.emit(
-                                f"Hinweis: Konnte Cache-Ordner nicht vollständig auflisten/bereinigen: {str(ce)}",
-                                "warn",
-                            )
-
-                    if deleted_cache_count > 0:
-                        self.result_signal.emit(
-                            f"System-Cache bereinigt ({deleted_cache_count} temporäre Cache-Dateien gelöscht).",
-                            "ok",
-                        )
-                    else:
-                        self.result_signal.emit(
-                            "System-Cache bereinigt (keine zu löschenden Cache-Dateien gefunden).",
-                            "ok",
-                        )
-                except Exception as ce:
-                    self.result_signal.emit(
-                        f"Fehler bei der automatischen Cache-Bereinigung: {str(ce)}",
-                        "error",
-                    )
-
-            self.result_signal.emit("Löschvorgang abgeschlossen.", "ok")
-            self.progress_signal.emit(f"Löschvorgang abgeschlossen ({total} Dateien bearbeitet).")
-        except Exception as e:
-            self.result_signal.emit(f"Kritischer Fehler beim Löschen: {str(e)}", "error")
-            self.progress_signal.emit("Fehler beim Löschvorgang.")
-        finally:
-            if getattr(self, "logger", None):
-                self.logger.end_session()
-            if conn:
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        conn.quit()
-                    else:
-                        conn.close()
-                except:
-                    pass
-            self.finished_signal.emit()
-
-
-class BakFileScannerWorker(QThread):
-    """
-    Worker-Thread zum Scannen nach .bak Dateien auf dem Server.
-    """
-
-    progress_signal = Signal(str)
-    result_signal = Signal(str, str)
-    finished_signal = Signal(list)
-    cancelled_signal = Signal()
-
-    def __init__(self, page_instance, profile):
-        super().__init__()
-        self.page = page_instance
-        self.profile = profile
-        self._is_cancelled = False
-        self.bak_files = []
-
-    def cancel(self):
-        self._is_cancelled = True
-        self.cancelled_signal.emit()
-
-    def run(self):
-        conn = None
-        try:
-            self.progress_signal.emit(f"Verbinde für .bak-Scan: {self.profile.get('shop_name')}")
-            conn, _ = self.page._check_connection(self.profile, self.result_signal)
-            if not conn:
-                self.finished_signal.emit([])
-                return
-
-            if self._is_cancelled:
-                return
-
-            # Rekursive Suche
-            self.progress_signal.emit("Starte rekursiven Scan nach .bak Dateien...")
-            skip_dirs = [
-                "images",
-                "cache",
-                "logs",
-                "export",
-                "import",
-                "backups",
-                "uploads",
-                "node_modules",
-                ".git",
-            ]
-
-            def walk(current_path):
-                if self._is_cancelled:
-                    return
-                self.progress_signal.emit(f"Scanne: {current_path}")
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        try:
-                            items = list(conn.mlsd())
-                            if not items:
-                                raise ValueError("MLSD empty")
-                            for name, attrs in items:
-                                if name in [".", ".."] or not name:
-                                    continue
-                                if any(sd == name for sd in skip_dirs):
-                                    continue
-                                full_item = name if current_path == "." else f"{current_path}/{name}"
-                                target_type = attrs.get("type", "").lower() if isinstance(attrs, dict) else ""
-
-                                if target_type == "dir":
-                                    try:
-                                        conn.cwd(name)
-                                        walk(full_item)
-                                    except:
-                                        pass
-                                    finally:
-                                        try:
-                                            conn.cwd("..")
-                                        except:
-                                            pass
-                                elif target_type in ["file", "os.unix.slink", ""]:
-                                    if full_item.lower().endswith(".bak"):
-                                        self.bak_files.append(full_item)
-                                        self.result_signal.emit(f".bak Datei gefunden: {full_item}", "warn")
-                        except:
-                            names = conn.nlst()
-                            for name in names:
-                                name = name.replace("\\", "/").split("/")[-1]
-                                if name in [".", ".."] or not name:
-                                    continue
-                                full_item = name if current_path == "." else f"{current_path}/{name}"
-                                if "." not in name and not name.startswith("."):
-                                    try:
-                                        conn.cwd(name)
-                                        if any(sd == name for sd in skip_dirs):
-                                            conn.cwd("..")
-                                            continue
-                                        walk(full_item)
-                                        conn.cwd("..")
-                                    except:
-                                        if full_item.lower().endswith(".bak"):
-                                            self.bak_files.append(full_item)
-                                            self.result_signal.emit(
-                                                f".bak Datei gefunden: {full_item}",
-                                                "warn",
-                                            )
-                                else:
-                                    if full_item.lower().endswith(".bak"):
-                                        self.bak_files.append(full_item)
-                                        self.result_signal.emit(f".bak Datei gefunden: {full_item}", "warn")
-                    else:
-                        for attr in conn.listdir_attr():
-                            name = attr.filename
-                            if name in [".", ".."] or not name:
-                                continue
-                            if any(sd == name for sd in skip_dirs):
-                                continue
-                            full_item = name if current_path == "." else f"{current_path}/{name}"
-                            if stat.S_ISDIR(attr.st_mode):
-                                try:
-                                    conn.chdir(name)
-                                    walk(full_item)
-                                    conn.chdir("..")
-                                except:
-                                    pass
-                            else:
-                                if full_item.lower().endswith(".bak"):
-                                    self.bak_files.append(full_item)
-                                    self.result_signal.emit(f".bak Datei gefunden: {full_item}", "warn")
-                except Exception:
-                    pass
-
-            walk(".")
-
-            if self._is_cancelled:
-                return
-
-            if not self.bak_files:
-                self.result_signal.emit("Keine .bak Dateien gefunden.", "ok")
-            else:
-                self.result_signal.emit(f"{len(self.bak_files)} .bak Dateien gefunden.", "warn")
-
-        except Exception as e:
-            self.result_signal.emit(f"Fehler beim Scan: {str(e)}", "error")
-        finally:
-            if conn:
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        conn.quit()
-                    else:
-                        conn.close()
-                except:
-                    pass
-            self.finished_signal.emit(self.bak_files)
-
-
-class LogfileWorker(QThread):
-    progress_signal = Signal(str)
-    result_signal = Signal(str, str)
-    finished_signal = Signal(list, list)  # (errors_found, files_deleted)
-    cancelled_signal = Signal()
-
-    def __init__(self, page_instance, profile, max_age_days, mode="scan"):
-        super().__init__()
-        self.page = page_instance
-        self.profile = profile
-        self.max_age_days = max_age_days
-        self.mode = mode  # 'scan' or 'cleanup'
-        self._is_cancelled = False
-        self.errors_found = []
-        self.files_deleted = []
-
-    def cancel(self):
-        self._is_cancelled = True
-        self.cancelled_signal.emit()
-
-    def run(self):
-        conn = None
-        try:
-            self.progress_signal.emit(f"Verbinde für Logfile-{self.mode}...")
-            conn, _ = self.page._check_connection(self.profile, self.result_signal)
-            if not conn:
-                self.finished_signal.emit([], [])
-                return
-
-            if self._is_cancelled:
-                return
-
-            log_dir = "logfiles"
-            try:
-                if isinstance(conn, ftplib.FTP):
-                    conn.cwd(log_dir)
-                else:
-                    conn.chdir(log_dir)
-            except Exception as e:
-                self.result_signal.emit(f"Konnte Ordner 'logfiles' nicht öffnen: {e}", "warn")
-                self.finished_signal.emit([], [])
-                return
-
-            self.progress_signal.emit("Lese Logfiles...")
-            files = []
-            now = datetime.datetime.now()
-            max_age_seconds = self.max_age_days * 86400
-
-            if isinstance(conn, ftplib.FTP):
-                try:
-                    for name, attrs in conn.mlsd():
-                        if name in [".", ".."]:
-                            continue
-                        if attrs.get("type") != "file":
-                            continue
-                        modify = attrs.get("modify")
-                        file_time = None
-                        if modify:
-                            try:
-                                file_time = datetime.datetime.strptime(modify, "%Y%m%d%H%M%S")
-                            except:
-                                pass
-                        files.append({"name": name, "time": file_time})
-                except:
-                    # Fallback if mlsd fails (e.g. some FTP servers)
-                    for name in conn.nlst():
-                        if name in [".", ".."]:
-                            continue
-                        # Wir schätzen das Alter über MDTM
-                        try:
-                            resp = conn.sendcmd(f"MDTM {name}")
-                            file_time = datetime.datetime.strptime(resp[4:18], "%Y%m%d%H%M%S")
-                            files.append({"name": name, "time": file_time})
-                        except:
-                            files.append({"name": name, "time": None})
-            else:
-                for attr in conn.listdir_attr("."):
-                    if attr.filename in [".", ".."]:
-                        continue
-                    if stat.S_ISDIR(attr.st_mode):
-                        continue
-                    file_time = datetime.datetime.fromtimestamp(attr.st_mtime)
-                    files.append({"name": attr.filename, "time": file_time})
-
-            if self._is_cancelled:
-                return
-
-            if self.mode == "cleanup":
-                self.progress_signal.emit("Lösche alte Logfiles...")
-                for f in files:
-                    if self._is_cancelled:
-                        break
-                    name = f["name"]
-                    if name in [".htaccess", "index.html"]:
-                        continue
-                    file_time = f["time"]
-                    if file_time:
-                        age_seconds = (now - file_time).total_seconds()
-                        if age_seconds > max_age_seconds:
-                            try:
-                                if isinstance(conn, ftplib.FTP):
-                                    conn.delete(name)
-                                else:
-                                    conn.remove(name)
-                                self.files_deleted.append(name)
-                                self.result_signal.emit(f"Gelöscht: {name}", "ok")
-                            except Exception as e:
-                                self.result_signal.emit(f"Fehler beim Löschen von {name}: {e}", "error")
-
-            elif self.mode == "scan":
-                self.progress_signal.emit("Analysiere Logfiles...")
-                keywords = [b"ERROR", b"FATAL", b"Exception", b"Parse error"]
-
-                for f in files:
-                    if self._is_cancelled:
-                        break
-                    name = f["name"]
-                    if name in [".htaccess", "index.html"]:
-                        continue
-                    if not (name.endswith(".log") or name.endswith(".txt")):
-                        continue
-
-                    # Wir analysieren nur Dateien, die nicht zu alt sind (oder alle?)
-                    # Um den Download in Grenzen zu halten, analysieren wir nur die letzten X Tage?
-                    # Für diesen Anwendungsfall analysieren wir alle gefundenen Logfiles.
-
-                    try:
-                        content = b""
-                        if isinstance(conn, ftplib.FTP):
-                            r_io = io.BytesIO()
-                            conn.retrbinary(f"RETR {name}", r_io.write)
-                            content = r_io.getvalue()
-                        else:
-                            with conn.open(name, "rb") as remote_file:
-                                content = remote_file.read()
-
-                        lines_content = content.splitlines()
-                        for i, line in enumerate(lines_content):
-                            if any(k in line for k in keywords):
-                                try:
-                                    decoded_line = line.decode("utf-8", errors="ignore")
-                                except:
-                                    decoded_line = str(line)
-                                self.errors_found.append(f"[{name}:Zeile {i + 1}] {decoded_line}")
-                    except Exception as e:
-                        self.result_signal.emit(f"Fehler beim Lesen von {name}: {e}", "warn")
-
-        except Exception as e:
-            self.result_signal.emit(f"Fehler bei Logfile-{self.mode}: {str(e)}", "error")
-        finally:
-            if conn:
-                try:
-                    if isinstance(conn, ftplib.FTP):
-                        conn.quit()
-                    else:
-                        conn.close()
-                except:
-                    pass
-            self.finished_signal.emit(self.errors_found, self.files_deleted)
+# Hinweis: HealthCheckWorker, LegacyDeleteWorker, BakFileScannerWorker und LogfileWorker
+# wurden zwecks Modularisierung und Testbarkeit nach ui/workers.py ausgelagert
+# und sind oben fuer Rueckwaertskompatibilitaet re-exportiert.
 
 
 class HealthCheckPage(QWidget):
@@ -848,16 +98,25 @@ class HealthCheckPage(QWidget):
     Prüft Konnektivität, Dateistruktur, Versionen und Berechtigungen.
     """
 
-    def __init__(self, auth_manager, config_manager, parent=None):
+    def __init__(
+        self,
+        auth_manager: MasterPasswordManager,
+        config_manager: ConfigManager,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.auth_manager = auth_manager
         self.config_manager = config_manager
-        self.current_logger = None
-        self.current_legacy_files = []
-        self.worker = None
+        self.current_logger: Optional[HealthCheckLogger] = None
+        self.current_legacy_files: list[str] = []
+        self.current_bak_files: list[str] = []
+        self.worker: Optional[HealthCheckWorker] = None
+        self.delete_worker: Optional[LegacyDeleteWorker] = None
+        self.bak_worker: Optional[BakFileScannerWorker] = None
+        self.log_worker: Optional[LogfileWorker] = None
         self._setup_ui()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
 
         # Header & Profilauswahl
@@ -917,7 +176,7 @@ class HealthCheckPage(QWidget):
             "color: white; background-color: #c0392b; font-weight: bold; padding: 10px; border-radius: 5px; font-size: 14px; margin-top: 5px; margin-bottom: 5px;"
         )
         warning_label.setWordWrap(True)
-        warning_label.setAlignment(Qt.AlignCenter)
+        warning_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(warning_label)
 
         # Bestätigungs-Checkbox
@@ -942,7 +201,7 @@ class HealthCheckPage(QWidget):
         bak_layout.addWidget(self.btn_delete_bak)
         layout.addWidget(bak_group)
 
-        self.current_bak_files = []
+        self.current_bak_files: list[str] = []
 
         # Logfile-Analyse Gruppe
         logfile_group = QGroupBox("Logfile Analyse & Bereinigung")
@@ -1008,21 +267,25 @@ class HealthCheckPage(QWidget):
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
 
         self.results_container = QWidget()
         self.results_layout = QVBoxLayout(self.results_container)
-        self.results_layout.setAlignment(Qt.AlignTop)
+        self.results_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         self.scroll_area.setWidget(self.results_container)
 
         # Automatisch ans Ende scrollen, wenn neue Ergebnisse hinzugefügt werden
         vsb = self.scroll_area.verticalScrollBar()
-        vsb.rangeChanged.connect(lambda min_val, max_val: vsb.setValue(max_val))
+
+        def _scroll_to_bottom(_min: int, max_val: int) -> None:
+            vsb.setValue(max_val)
+
+        vsb.rangeChanged.connect(_scroll_to_bottom)
 
         layout.addWidget(self.scroll_area)
 
-    def _add_result(self, text: str, status: str = "ok"):
+    def _add_result(self, text: str, status: str = "ok") -> None:
         """
         Fügt ein farbiges Label zum Ergebnisbereich hinzu.
         status: 'ok' (Grün), 'warn' (Gelb), 'error' (Rot)
@@ -1046,20 +309,22 @@ class HealthCheckPage(QWidget):
         label.setWordWrap(True)
         self.results_layout.addWidget(label)
 
-    def _update_delete_buttons_state(self):
+    def _update_delete_buttons_state(self) -> None:
         confirmed = self.cb_backup_confirmed.isChecked()
         self.btn_cleanup_logs.setEnabled(confirmed)
         self.btn_delete_bak.setEnabled(confirmed and bool(self.current_bak_files))
         self.btn_delete_legacy.setEnabled(confirmed and bool(self.current_legacy_files))
 
-    def _clear_results(self):
+    def _clear_results(self) -> None:
         """Löscht alle vorherigen Ergebnisse."""
         while self.results_layout.count():
             child = self.results_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            if child is not None:
+                w = child.widget()
+                if w is not None:
+                    w.deleteLater()
 
-    def _load_profiles(self):
+    def _load_profiles(self) -> None:
         """Aktualisiert die Profilliste."""
         self.combo_profiles.blockSignals(True)
         self.combo_profiles.clear()
@@ -1079,7 +344,7 @@ class HealthCheckPage(QWidget):
 
         self.combo_profiles.blockSignals(False)
 
-    def _on_profile_selected(self, index):
+    def _on_profile_selected(self, index: int) -> None:
         if index >= 0:
             profile_name = self.combo_profiles.currentText()
             self.config_manager.set_last_selected_profile_name(profile_name)
@@ -1090,7 +355,7 @@ class HealthCheckPage(QWidget):
                 except Exception:
                     pass
 
-    def run_health_check(self, mode="full"):
+    def run_health_check(self, mode: str = "full") -> None:
         """Hauptroutine für den Health-Check."""
         try:
             self.auth_manager.require_active_session()
@@ -1101,9 +366,9 @@ class HealthCheckPage(QWidget):
                     self,
                     "Baseline erzeugen",
                     "Dies überschreibt die vorhandene Referenz. Alle aktuellen Dateien gelten danach als 'sicher'. Fortfahren?",
-                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 )
-                if reply != QMessageBox.Yes:
+                if reply != QMessageBox.StandardButton.Yes:
                     return
 
             self._clear_results()
@@ -1150,11 +415,11 @@ class HealthCheckPage(QWidget):
         except Exception as e:
             # Ensure UI is reset even on unexpected errors
             logger.error(f"Health-Check Fehler: {e}")
-            self._add_result(f"Unerwarteter Fehler: {str(e)}", "error")
+            self._add_result(f"Unerwarteter Fehler: {e!s}", "error")
             self.btn_run.setEnabled(True)
             self.btn_cancel.setEnabled(False)  # Abbruch-Button deaktivieren
 
-    def _open_log_folder(self):
+    def _open_log_folder(self) -> None:
         """Öffnet den Explorer im Log-Verzeichnis des aktuellen Profils."""
         profile_idx = self.combo_profiles.currentIndex()
         profiles = self.config_manager.get_profiles()
@@ -1162,7 +427,7 @@ class HealthCheckPage(QWidget):
             logger_tmp = HealthCheckLogger(profiles[profile_idx].get("shop_name", "default"))
             open_path(logger_tmp.get_log_dir())
 
-    def _open_last_log(self):
+    def _open_last_log(self) -> None:
         """Öffnet die aktuellste Log-Datei des ausgewählten Profils."""
         profile_idx = self.combo_profiles.currentIndex()
         profiles = self.config_manager.get_profiles()
@@ -1174,14 +439,14 @@ class HealthCheckPage(QWidget):
             else:
                 show_error("Keine Log-Dateien für dieses Profil gefunden.")
 
-    def _emit_progress(self, message: str):
+    def _emit_progress(self, message: str) -> None:
         """Sendet sicher Status-Updates an die GUI, egal ob im Thread oder nicht."""
         if hasattr(self, "worker") and self.worker and self.worker.isRunning():
             self.worker.progress_signal.emit(message)
         else:
             self.status_label.setText(message)
 
-    def _set_legacy_files(self, files):
+    def _set_legacy_files(self, files: list[str]) -> None:
         """Speichert die gefundenen Altlasten und aktiviert den Button."""
         self.current_legacy_files = files
         if self.current_legacy_files:
@@ -1190,13 +455,13 @@ class HealthCheckPage(QWidget):
             self.legacy_group.hide()  # Gruppe ausblenden, wenn keine Altlasten gefunden wurden
         self._update_delete_buttons_state()
 
-    def update_status(self, text: str):
+    def update_status(self, text: str) -> None:
         """Updates the status label with the current progress message."""
         self.status_label.setText(text)
         if self.current_logger:
             self.current_logger.log("INFO", f"STATUS: {text}")
 
-    def check_finished(self):
+    def check_finished(self) -> None:
         """Wird aufgerufen, wenn der Worker-Thread fertig ist."""
         self.btn_run.setEnabled(True)
         self.btn_cancel.setEnabled(False)  # Abbruch-Button deaktivieren
@@ -1204,7 +469,7 @@ class HealthCheckPage(QWidget):
         self.btn_run.setText("Health-Check starten")
 
         # Final status message (nur loggen, wenn Logger noch offen ist)
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             if self.current_logger and not getattr(self.current_logger.file_handle, "closed", True):
                 self._add_result("--- Health-Check abgebrochen ---", "warn")
             self.status_label.setText("Health-Check abgebrochen.")
@@ -1217,7 +482,7 @@ class HealthCheckPage(QWidget):
         self.spinner_bar.hide()
         self.auth_manager.update_activity()
 
-    def cancel_all(self):
+    def cancel_all(self) -> None:
         """Bricht alle laufenden Aktionen in dieser Ansicht ab."""
         self._cancel_health_check()
 
@@ -1229,9 +494,9 @@ class HealthCheckPage(QWidget):
         if hasattr(self, "log_worker") and self.log_worker and self.log_worker.isRunning():
             self.log_worker.cancel()
 
-    def _cancel_health_check(self):
+    def _cancel_health_check(self) -> None:
         """Bricht den laufenden Health-Check ab."""
-        if hasattr(self, "worker") and self.worker.isRunning():
+        if hasattr(self, "worker") and self.worker and self.worker.isRunning():
             self.worker.cancel()
             self.status_label.setText("Health-Check wird abgebrochen...")
             self._add_result("Health-Check manuell abgebrochen.", "warn")
@@ -1240,7 +505,7 @@ class HealthCheckPage(QWidget):
         else:
             self.status_label.setText("Kein Health-Check läuft.")
 
-    def _ensure_connection(self, conn, profile=None):
+    def _ensure_connection(self, conn: Any, profile: Optional[dict[str, Any]] = None) -> Any:
         """Prüft, ob die FTP/SFTP-Verbindung noch aktiv ist, und stellt sie bei Bedarf transparent wieder her."""
         if conn is not None:
             try:
@@ -1263,7 +528,9 @@ class HealthCheckPage(QWidget):
                 pass
         return conn
 
-    def _run_legacy_delete_analysis_logic(self, conn, signal=None, profile=None):
+    def _run_legacy_delete_analysis_logic(
+        self, conn: Any, signal: Any = None, profile: Optional[dict[str, Any]] = None
+    ) -> list[str]:
         """
         Analysiert alle Update-Ordner chronologisch auf zu löschende Dateien.
         Berücksichtigt Konflikte durch Wiedereinführung von Dateien.
@@ -1271,7 +538,7 @@ class HealthCheckPage(QWidget):
         if profile is None and hasattr(self, "worker") and self.worker:
             profile = getattr(self.worker, "profile", None)
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -1281,14 +548,15 @@ class HealthCheckPage(QWidget):
         update_base = "gambio_updater/updates"
 
         # Check for cancellation before starting long operations
-        delete_map = {}  # Datei -> Letzte Version, in der sie gelöscht werden sollte
-        added_map = {}  # Datei -> Letzte Version, in der sie geändert/hinzugefügt wurde
+        delete_map: dict[str, tuple[int, ...]] = {}  # Datei -> Letzte Version, in der sie gelöscht werden sollte
+        added_map: dict[str, tuple[int, ...]] = {}  # Datei -> Letzte Version, in der sie geändert/hinzugefügt wurde
 
         try:
             # Verbindung sicherstellen (Reconnect falls nach vorherigen Scans geschlossen)
             conn = self._ensure_connection(conn, profile)
 
             # 1. Update-Ordner auslesen & sortieren
+            folders: list[str] = []
             try:
                 if isinstance(conn, ftplib.FTP):
                     folders = [f.split("/")[-1].split("\\")[-1] for f in conn.nlst(update_base)]
@@ -1303,7 +571,7 @@ class HealthCheckPage(QWidget):
                 else:
                     folders = [f.filename for f in conn.listdir_attr(update_base) if stat.S_ISDIR(f.st_mode)]
 
-            versioned_folders = []
+            versioned_folders: list[tuple[tuple[int, ...], str]] = []
             for f in folders:
                 if f.startswith("v"):
                     v_str = f[1:]
@@ -1366,14 +634,7 @@ class HealthCheckPage(QWidget):
                         if not p:
                             continue
                         # PHP-interne Strings herausfiltern
-                        if (
-                            p.startswith("$")
-                            or p.startswith("<?")
-                            or p.startswith("http")
-                            or p.startswith("//")
-                            or "\n" in p
-                            or len(p) < 3
-                        ):
+                        if p.startswith(("$", "<?", "http", "//")) or "\n" in p or len(p) < 3:
                             continue
                         # Keine PHP-Schlüsselwörter / Kommentare
                         if p in ("true", "false", "null", "return", "array_merge"):
@@ -1437,10 +698,10 @@ class HealthCheckPage(QWidget):
             # Eine Datei ist nur dann ein Kandidat, wenn die letzte Löschanweisung
             # NEUER oder GLEICH der letzten Hinzufügung ist.
             # Speichert (file_path, del_v_tuple) damit die Version in der Ausgabe erscheint
-            final_delete_list = []
+            final_delete_list: list[tuple[str, tuple[int, ...]]] = []
             for file_path, del_v in delete_map.items():
                 if any(ex in file_path for ex in excluded_list):
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return []
                     continue
                 add_v = added_map.get(file_path, (0,))
@@ -1449,17 +710,16 @@ class HealthCheckPage(QWidget):
             final_delete_list.sort(key=lambda x: x[0])  # Nach Pfad sortieren
 
             # 4. Existenzprüfung
-            legacy_found = []
+            legacy_found: list[str] = []
             log(f"Analysiere {len(final_delete_list)} potenzielle Altlasten auf dem Server...")
 
             for file_path, del_v in final_delete_list:
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return []
 
                 # Wenn ein Ordner-Inhalt gelöscht werden soll (/*),
                 # löschen wir stattdessen den Ordner selbst rekursiv.
-                if file_path.endswith("/*"):
-                    file_path = file_path[:-2]
+                file_path = file_path.removesuffix("/*")
 
                 # Prüfen auf Wildcard (*)
                 if "*" in file_path:
@@ -1483,8 +743,7 @@ class HealthCheckPage(QWidget):
                                     if fnmatch.fnmatch(name, pattern):
                                         full_item = item if "/" in item else f"{parent_dir}/{item}"
                                         # `./` Präfix entfernen falls vorhanden
-                                        if full_item.startswith("./"):
-                                            full_item = full_item[2:]
+                                        full_item = full_item.removeprefix("./")
                                         matched_items.append(full_item)
                             except:
                                 pass
@@ -1495,8 +754,7 @@ class HealthCheckPage(QWidget):
                                         continue
                                     if fnmatch.fnmatch(entry.filename, pattern):
                                         full_item = f"{parent_dir}/{entry.filename}"
-                                        if full_item.startswith("./"):
-                                            full_item = full_item[2:]
+                                        full_item = full_item.removeprefix("./")
                                         matched_items.append(full_item)
                             except:
                                 pass
@@ -1554,8 +812,7 @@ class HealthCheckPage(QWidget):
                     if exists:
                         # Präfix `./` entfernen falls vorhanden
                         clean_path = file_path
-                        if clean_path.startswith("./"):
-                            clean_path = clean_path[2:]
+                        clean_path = clean_path.removeprefix("./")
                         # Prüfen ob Datei oder Ordner
                         last_part = clean_path.split("/")[-1]
                         entry_type = "Ordner" if "." not in last_part else "Datei"
@@ -1577,10 +834,10 @@ class HealthCheckPage(QWidget):
 
         except Exception as e:
             if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
-                log(f"Hinweis bei Delete-Analyse: {str(e)}", "warn")
+                log(f"Hinweis bei Delete-Analyse: {e!s}", "warn")
             return legacy_found
 
-    def _delete_legacy_files(self):
+    def _delete_legacy_files(self) -> None:
         """Initialisiert den Löschvorgang für die gefundenen Dateien."""
         if not self.current_legacy_files:
             return
@@ -1589,10 +846,10 @@ class HealthCheckPage(QWidget):
             self,
             "Altlasten löschen",
             f"Möchten Sie {len(self.current_legacy_files)} Dateien unwiderruflich vom Server löschen?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
 
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         try:
@@ -1610,7 +867,7 @@ class HealthCheckPage(QWidget):
             last_log = logger_instance.get_last_log_file()
             if last_log:
                 logger_instance.current_file = last_log
-                logger_instance.file_handle = open(last_log, "a", encoding="utf-8")
+                logger_instance.file_handle = open(last_log, "a", encoding="utf-8")  # noqa: SIM115
                 logger_instance.log("INFO", "--- Löschvorgang gestartet ---")
             else:
                 logger_instance.start_session()
@@ -1630,14 +887,14 @@ class HealthCheckPage(QWidget):
         except SessionExpiredError:
             show_error("Sitzung abgelaufen. Bitte erneut anmelden.")
 
-    def _on_legacy_deleted(self):
+    def _on_legacy_deleted(self) -> None:
         """Callback nach dem Löschvorgang."""
         self.btn_run.setEnabled(True)
         self.current_legacy_files = []
         self._update_delete_buttons_state()
         self.auth_manager.update_activity()
 
-    def _scan_bak_files(self):
+    def _scan_bak_files(self) -> None:
         profile_idx = self.combo_profiles.currentIndex()
         if profile_idx < 0:
             return
@@ -1656,7 +913,7 @@ class HealthCheckPage(QWidget):
         self.bak_worker.finished_signal.connect(self._on_bak_scan_finished)
         self.bak_worker.start()
 
-    def _on_bak_scan_finished(self, files):
+    def _on_bak_scan_finished(self, files: list[str]) -> None:
         self.spinner_bar.hide()
         self.btn_scan_bak.setEnabled(True)
         self.btn_run.setEnabled(True)
@@ -1666,7 +923,7 @@ class HealthCheckPage(QWidget):
         self._update_delete_buttons_state()
         self.auth_manager.update_activity()
 
-    def _scan_logfiles(self):
+    def _scan_logfiles(self) -> None:
         profile_idx = self.combo_profiles.currentIndex()
         if profile_idx < 0:
             return
@@ -1685,7 +942,7 @@ class HealthCheckPage(QWidget):
         self.log_worker.finished_signal.connect(self._on_log_scan_finished)
         self.log_worker.start()
 
-    def _on_log_scan_finished(self, errors_found, files_deleted):
+    def _on_log_scan_finished(self, errors_found: list[str], files_deleted: list[str]) -> None:
         self.spinner_bar.hide()
         self.btn_scan_logs.setEnabled(True)
         self._update_delete_buttons_state()
@@ -1699,9 +956,9 @@ class HealthCheckPage(QWidget):
                 self,
                 "Fehler gefunden",
                 f"Es wurden {len(errors_found)} Fehler in den Logfiles gefunden.\nMöchten Sie diese als Bericht für den Support exportieren?",
-                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 profile_name = self.combo_profiles.currentText()
                 path, _ = QFileDialog.getSaveFileName(
                     self,
@@ -1741,7 +998,7 @@ class HealthCheckPage(QWidget):
                 "ok",
             )
 
-    def _cleanup_logfiles(self):
+    def _cleanup_logfiles(self) -> None:
         profile_idx = self.combo_profiles.currentIndex()
         if profile_idx < 0:
             return
@@ -1752,9 +1009,9 @@ class HealthCheckPage(QWidget):
             self,
             "Alte Logfiles löschen",
             f"Möchten Sie alle Dateien im Ordner 'logfiles', die älter als {max_age} Tage sind (außer .htaccess und index.html), unwiderruflich löschen?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         self.btn_scan_logs.setEnabled(False)
@@ -1769,7 +1026,7 @@ class HealthCheckPage(QWidget):
         self.log_worker.finished_signal.connect(self._on_log_cleanup_finished)
         self.log_worker.start()
 
-    def _on_log_cleanup_finished(self, errors_found, files_deleted):
+    def _on_log_cleanup_finished(self, errors_found: list[str], files_deleted: list[str]) -> None:
         self.spinner_bar.hide()
         self.btn_scan_logs.setEnabled(True)
         self._update_delete_buttons_state()
@@ -1779,16 +1036,16 @@ class HealthCheckPage(QWidget):
 
         self._add_result(f"Bereinigung abgeschlossen: {len(files_deleted)} Dateien gelöscht.", "ok")
 
-    def _delete_bak_files(self):
+    def _delete_bak_files(self) -> None:
         if not self.current_bak_files:
             return
         reply = QMessageBox.warning(
             self,
             "Backup-Dateien löschen",
             f"Möchten Sie {len(self.current_bak_files)} .bak Dateien unwiderruflich vom Server löschen?",
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if reply != QMessageBox.Yes:
+        if reply != QMessageBox.StandardButton.Yes:
             return
 
         try:
@@ -1809,110 +1066,37 @@ class HealthCheckPage(QWidget):
         except SessionExpiredError:
             show_error("Sitzung abgelaufen. Bitte erneut anmelden.")
 
-    def _on_bak_deleted(self):
+    def _on_bak_deleted(self) -> None:
         self.btn_run.setEnabled(True)
         self.btn_scan_bak.setEnabled(True)
         self.current_bak_files = []
         self._update_delete_buttons_state()
         self.auth_manager.update_activity()
 
-    def _check_connection(self, profile, signal=None):
+    def _check_connection(self, profile: dict[str, Any], signal: Any = None) -> tuple[Any, list[str]]:
         """
         Prüft die FTP/SFTP Verbindung und listet Dateien auf.
         Verwendet result_signal für detaillierte Ausgaben und progress_signal für den Status-Label.
+        Erzwingt standardmäßig TLS für FTP und blockiert unverschlüsselte Fallbacks,
+        sofern nicht explizit im Profil erlaubt.
         """
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        self._emit_progress("Verbinde zum Server...")
+        return NetworkService.create_remote_connection(
+            profile=profile,
+            log_callback=log,
+            progress_callback=self._emit_progress,
+        )
 
-        # No cancellation check here, as connection is a single blocking call
-        try:
-            protocol = profile.get("protocol", "FTP")
-            raw_host = str(profile.get("host", "")).strip()
-            host = re.sub(r"^[a-zA-Z]+://", "", raw_host).strip("/")
-
-            raw_port = profile.get("port")
-            try:
-                port = int(raw_port)
-                if port <= 0:
-                    port = 22 if protocol == "SFTP" else 21
-            except (ValueError, TypeError):
-                port = 22 if protocol == "SFTP" else 21
-
-            user = str(profile.get("username", "")).strip()
-            pwd = profile.get("password", "")
-            r_path = str(profile.get("remote_path", "")).strip()
-            timeout = int(profile.get("timeout", 10))
-
-            self._emit_progress(f"Verbinde zu {host}:{port} ({protocol})...")
-            log(f"Starte Verbindung zu {host}:{port} über {protocol}...")
-
-            files = []
-            if protocol == "FTP":
-                log(f"Verbinde via FTP mit {host}:{port}...")
-                use_tls = False
-                ftp_timeout = int(profile.get("timeout", 25))
-                try:
-                    ftp = ftplib.FTP_TLS()
-                    ftp.connect(host, port, timeout=ftp_timeout)
-                    ftp.auth()
-                    use_tls = True
-                    log("Explizites TLS aktiviert (FTPS).")
-                except Exception:
-                    ftp = ftplib.FTP()
-                    ftp.connect(host, port, timeout=ftp_timeout)
-                    log("Verbinde über Standard-FTP (ohne TLS)...")
-
-                ftp.trust_server_pasv_ipv4_address = True
-                log(f"Netzwerkverbindung zu {host}:{port} hergestellt. Authentifiziere...")
-                ftp.login(user, pwd)
-                if use_tls:
-                    try:
-                        ftp.prot_p()  # TLS für den Datenkanal (nlst, retr, etc.)
-                        log("TLS-Schutz für Datenverbindung aktiviert (PROT P).")
-                    except Exception:
-                        pass
-                log(f"FTP-Login als '{user}' erfolgreich.")
-                if r_path:
-                    ftp.cwd(r_path)
-                    log(f"FTP-Verzeichnis gewechselt zu '{r_path}'.")
-                log("Lese Verzeichnisinhalt...")
-                files = ftp.nlst()  # This can be slow for large directories
-                log(f"FTP-Verbindung erfolgreich hergestellt ({len(files)} Einträge gefunden).")
-                return ftp, files
-
-            elif protocol == "SFTP":
-                if paramiko is None:
-                    log("SFTP (Paramiko) ist nicht installiert.", "error")
-                    return None, []
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(host, port, user, pwd, timeout=timeout)
-                log(f"SSH-Verbindung zu {host}:{port} hergestellt. Öffne SFTP-Kanal...")
-                sftp = ssh.open_sftp()
-                if r_path:
-                    sftp.chdir(r_path)  # Change directory first
-                    log(f"SFTP-Verzeichnis gewechselt zu '{r_path}'.")
-                files = sftp.listdir()  # Then list files
-                log(f"SFTP-Verbindung erfolgreich hergestellt ({len(files)} Einträge gefunden).")
-                return sftp, files
-
-            log(f"Protokoll {protocol} wird für Dateiprüfung nicht unterstützt.", "warn")
-            return None, []
-        except Exception as e:  # Catch all exceptions for connection
-            err_type = type(e).__name__
-            log(f"Verbindungsfehler [{protocol}://{host}:{port}] ({err_type}): {str(e)}", "error")
-            return None, []
-
-    def _check_gambio_structure(self, files, signal=None):
+    def _check_gambio_structure(self, files: list[str], signal: Any = None) -> bool:
         """Sucht nach Gambio-typischen Verzeichnissen."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -1927,62 +1111,62 @@ class HealthCheckPage(QWidget):
             return True
         return False
 
-    def _check_version(self, conn, profile, signal=None):
+    def _check_version(self, conn: Any, profile: dict[str, Any], signal: Any = None) -> Optional[str]:
         """
         Ermittelt die Gambio-Version aus dem Ordner version_info/.
         """
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
         self._emit_progress("Ermittle Gambio-Version...")
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return None
 
         version_dir = "version_info"
         detected_version = None
         try:
-            files = []
+            files: list[str] = []
             if isinstance(conn, ftplib.FTP):
                 try:
                     # Verzeichnisinhalt auflisten
                     raw_files = conn.nlst(version_dir)
                     # Bereinigen: nlst kann Pfade enthalten (z.B. version_info/build_...)
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return None
                     files = [f.split("/")[-1].split("\\")[-1] for f in raw_files]
                 except ftplib.error_perm:
                     log("Ordner version_info nicht gefunden.", "error")
-                    return
+                    return None
             else:  # SFTP
                 try:
                     files = conn.listdir(version_dir)
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return None
                 except Exception:
                     log("Ordner version_info nicht gefunden.", "error")
-                    return
+                    return None
 
             # Suche nach build_(\d+).php Dateien
             build_pattern = re.compile(r"build_(\d+)\.php")
             candidates = []
             for f in files:
                 match = build_pattern.match(f)
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return None
                 if match:
                     candidates.append((int(match.group(1)), f))
 
             if not candidates:
                 log("Keine Build-Dateien gefunden.", "warn")
-                return
+                return None
 
             # Höchste Job-ID (Build-Nummer) bestimmen
             candidates.sort(key=lambda x: x[0], reverse=True)
-            highest_id, build_filename = candidates[0]
+            _highest_id, build_filename = candidates[0]
             file_path = f"{version_dir}/{build_filename}"
 
             # Inhalt der neuesten Build-Datei lesen
@@ -1990,7 +1174,7 @@ class HealthCheckPage(QWidget):
             if isinstance(conn, ftplib.FTP):
                 r_file = io.BytesIO()
                 conn.retrbinary(f"RETR {file_path}", r_file.write)
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return None
                 content = r_file.getvalue().decode("utf-8", errors="ignore")
             else:  # SFTP
@@ -2009,21 +1193,21 @@ class HealthCheckPage(QWidget):
                 log("Build-Datei konnte nicht gelesen werden.", "warn")
 
         except Exception as e:
-            log(f"Fehler bei Versionsprüfung: {str(e)}", "error")
+            log(f"Fehler bei Versionsprüfung: {e!s}", "error")
 
         return detected_version
 
-    def _check_write_permissions(self, conn, profile, signal=None):
+    def _check_write_permissions(self, conn: Any, profile: dict[str, Any], signal: Any = None) -> None:
         """Prüft Schreibrechte durch Upload einer Testdatei."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
         self._emit_progress("Prüfe Schreibrechte...")
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
 
         test_filename = "hc_write_test.tmp"
@@ -2034,7 +1218,7 @@ class HealthCheckPage(QWidget):
                 conn.delete(test_filename)
             else:  # SFTP
                 conn.putfo(test_data, test_filename)
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return
                 conn.remove(test_filename)
             log("Schreibrechte im Shop-Hauptverzeichnis: OK")
@@ -2042,12 +1226,14 @@ class HealthCheckPage(QWidget):
             self._emit_progress("Eingeschränkte Schreibrechte erkannt.")
             log("Eingeschränkte Schreibrechte im Hauptverzeichnis.", "warn")
 
-    def _check_php_version_via_ftp_http(self, conn, profile, signal=None):
+    def _check_php_version_via_ftp_http(
+        self, conn: Any, profile: dict[str, Any], signal: Any = None
+    ) -> Optional[dict[str, Any]]:
         """
         Ermittelt die PHP-Version durch Hochladen einer temporären Datei,
         """
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -2145,7 +1331,7 @@ class HealthCheckPage(QWidget):
 
         try:
             for attempt in range(1, 4):
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return {}
                 try:
                     test_data_stream.seek(0)
@@ -2154,7 +1340,7 @@ class HealthCheckPage(QWidget):
                         # Verifikation des Uploads
                         try:
                             size = conn.size(temp_php_filename)
-                            if size > 0:
+                            if size is not None and size > 0:
                                 log(
                                     f"Upload verifiziert: {temp_php_filename} ({size} Bytes) im Pfad {conn.pwd()}",
                                     "ok",
@@ -2199,7 +1385,7 @@ class HealthCheckPage(QWidget):
                             )
                 except Exception as e:
                     log(
-                        f"Fehler beim Hochladen der PHP-Datei für Versionsprüfung (Versuch {attempt}): {str(e)}",
+                        f"Fehler beim Hochladen der PHP-Datei für Versionsprüfung (Versuch {attempt}): {e!s}",
                         "warn",
                     )
 
@@ -2214,7 +1400,7 @@ class HealthCheckPage(QWidget):
 
             # 2. HTTP-Aufruf mit Retry-Logik
             php_version = None
-            if self.worker._is_cancelled:
+            if self.worker and self.worker._is_cancelled:
                 return {}
             for attempt in range(1, 4):
                 try:
@@ -2223,7 +1409,7 @@ class HealthCheckPage(QWidget):
                     self._emit_progress(f"Warte {wait_time}s auf Server-Freigabe (Versuch {attempt})...")
                     time.sleep(wait_time)
 
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return {}  # Check after sleep
                     response = requests.get(full_http_url, timeout=10, verify=True)
 
@@ -2257,10 +1443,10 @@ class HealthCheckPage(QWidget):
 
                 except Exception as e:
                     log(
-                        f"HTTP-Aufruf Versuch {attempt} fehlgeschlagen: {str(e)}",
+                        f"HTTP-Aufruf Versuch {attempt} fehlgeschlagen: {e!s}",
                         "warn",
                     )
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return {}  # Check after failed attempt
 
                 if attempt == 3:
@@ -2272,38 +1458,37 @@ class HealthCheckPage(QWidget):
             # 3. Löschen der PHP-Datei
             try:
                 if isinstance(conn, ftplib.FTP):
-                    if self.worker._is_cancelled:
-                        return {}
-                    try:
-                        conn.delete(temp_php_filename)
-                    except ftplib.error_perm as e:
-                        if "550" not in str(e):
-                            log(
-                                f"Warnung: Temporäre PHP-Datei konnte nicht gelöscht werden: {str(e)}",
-                                "warn",
-                            )
+                    if not (self.worker and self.worker._is_cancelled):
+                        try:
+                            conn.delete(temp_php_filename)
+                        except ftplib.error_perm as e:
+                            if "550" not in str(e):
+                                log(
+                                    f"Warnung: Temporäre PHP-Datei konnte nicht gelöscht werden: {e!s}",
+                                    "warn",
+                                )
                 else:  # SFTP
                     self._emit_progress("Lösche temporäre PHP-Datei...")
                     try:
                         conn.remove(temp_php_filename)
-                    except IOError:  # SFTP typischerweise IOError wenn Datei fehlt
+                    except OSError:  # SFTP typischerweise IOError wenn Datei fehlt
                         pass
             except Exception as e:
                 log(
-                    f"Warnung: Temporäre PHP-Datei konnte nicht gelöscht werden: {str(e)}",
+                    f"Warnung: Temporäre PHP-Datei konnte nicht gelöscht werden: {e!s}",
                     "warn",
                 )
 
         return {}
 
-    def _extract_version_number(self, ver_str):
+    def _extract_version_number(self, ver_str: Optional[str]) -> Optional[str]:
         """Extrahiert die reine Versionsnummer aus Strings wie 'mysqlnd 10.6.12-MariaDB'."""
         if not ver_str:
             return None
         match = re.search(r"(\d+\.\d+\.\d+)", ver_str)
         return match.group(1) if match else None
 
-    def _parse_ver_tuple(self, ver_str):
+    def _parse_ver_tuple(self, ver_str: Optional[str]) -> tuple[int, ...]:
         """Hilfsmethode: Extrahiert Zahlen aus Version-String für Vergleich."""
         if not ver_str or not ver_str.strip():
             return (0,)
@@ -2317,7 +1502,7 @@ class HealthCheckPage(QWidget):
             logger.exception(f"Unerwarteter Fehler beim Parsen der Version '{ver_str}'")
             return (0,)
 
-    def _ver_tuple_to_str(self, v_tuple):
+    def _ver_tuple_to_str(self, v_tuple: tuple[int, ...]) -> str:
         """Hilfsmethode: Wandelt ein Versions-Tupel z.B. (4, 9, 1, 0) in 'v4.9.1.0' um."""
         if not v_tuple or v_tuple == (0,):
             return "unbekannt"
@@ -2325,34 +1510,35 @@ class HealthCheckPage(QWidget):
 
     def _run_update_analysis_logic(
         self,
-        conn,
-        current_shop_ver,
-        current_php_ver,
-        current_mysql_ver,
-        current_db_type,
-        root_files,
-        signal=None,
-    ):
+        conn: Any,
+        current_shop_ver: Optional[str],
+        current_php_ver: Optional[str],
+        current_mysql_ver: Optional[str],
+        current_db_type: Optional[str],
+        root_files: list[str],
+        signal: Any = None,
+    ) -> None:
         """Vollständige Update-Analyse-Engine."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
         self._emit_progress("Starte Update-Analyse...")
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         log("Starte Update-Analyse...", "ok")
         update_base_path = "gambio_updater/updates"
 
         # 1. Update-Ordner auslesen
         try:
+            update_folders: list[str] = []
             if isinstance(conn, ftplib.FTP):
                 try:
                     update_folders = conn.nlst(update_base_path)
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return
                     self._emit_progress("Lese FTP-Update-Ordner...")
                 except ftplib.error_perm:
@@ -2364,7 +1550,7 @@ class HealthCheckPage(QWidget):
             else:  # SFTP
                 try:
                     update_folders = conn.listdir(update_base_path)
-                    if self.worker._is_cancelled:
+                    if self.worker and self.worker._is_cancelled:
                         return
                     self._emit_progress("Lese SFTP-Update-Ordner...")
                 except:
@@ -2375,9 +1561,9 @@ class HealthCheckPage(QWidget):
                     return
 
             # Bereinigen und Versionen extrahieren
-            version_map = {}
+            version_map: dict[tuple[int, ...], tuple[str, str]] = {}
             for f in update_folders:
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return
                 folder_name = f.split("/")[-1].split("\\")[-1]
                 if folder_name.startswith("v"):
@@ -2396,7 +1582,7 @@ class HealthCheckPage(QWidget):
             log(f"Höchste verfügbare Update-Version erkannt: {highest_ver_str}")
 
             # 2. configuration.ini laden und parsen
-            if self.worker._is_cancelled:
+            if self.worker and self.worker._is_cancelled:
                 return
             self._emit_progress("Lade configuration.ini...")
             config_data = self._load_update_ini(conn, target_path)
@@ -2408,28 +1594,28 @@ class HealthCheckPage(QWidget):
 
             if config_data:
                 # 3. PHP-Version Prüfung
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return
                 self._emit_progress("Prüfe PHP-Kompatibilität für Update...")
                 self._check_update_php_compat(config_data, current_php_ver, signal)
                 # 4. Shop-Version Prüfung
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return
                 self._emit_progress("Prüfe Shop-Version für Update...")
                 self._check_update_shop_compat(config_data, current_shop_ver, target_version, signal)
                 # 5. MySQL Prüfung
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return
                 self._emit_progress("Prüfe Datenbank-Kompatibilität für Update...")
                 self._check_mysql_version(config_data, current_mysql_ver, current_db_type, signal)
 
             # 6. updated_files.txt prüfen
-            if self.worker._is_cancelled:
+            if self.worker and self.worker._is_cancelled:
                 return
             files_ok = self._check_updated_files(conn, target_path, signal)
 
             # 7. to_delete.php prüfen
-            if self.worker._is_cancelled:
+            if self.worker and self.worker._is_cancelled:
                 return
             deleted_ok = self._check_files_to_delete(conn, target_path, signal)
 
@@ -2438,9 +1624,9 @@ class HealthCheckPage(QWidget):
 
             self._emit_progress("Update-Analyse abgeschlossen.")
         except Exception as e:
-            log(f"Fehler in der Update-Analyse-Engine: {str(e)}", "error")
+            log(f"Fehler in der Update-Analyse-Engine: {e!s}", "error")
 
-    def _load_update_ini(self, conn, folder_path):
+    def _load_update_ini(self, conn: Any, folder_path: str) -> Optional[configparser.ConfigParser]:
         """Lädt und parst die configuration.ini per FTP/SFTP."""
         ini_path = f"{folder_path}/configuration.ini"
         content = ""
@@ -2449,7 +1635,7 @@ class HealthCheckPage(QWidget):
                 r_io = io.BytesIO()
                 conn.retrbinary(f"RETR {ini_path}", r_io.write)
                 content = r_io.getvalue().decode("utf-8", errors="ignore")
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return None
             else:
                 with conn.open(ini_path, "r") as f:
@@ -2466,14 +1652,16 @@ class HealthCheckPage(QWidget):
             )
             return None
 
-    def _check_update_php_compat(self, config, current_php, signal=None):
-        def log(msg, status="ok"):
+    def _check_update_php_compat(
+        self, config: configparser.ConfigParser, current_php: Optional[str], signal: Any = None
+    ) -> None:
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         if not current_php or not config.has_section("compatibility"):
             return
@@ -2508,14 +1696,16 @@ class HealthCheckPage(QWidget):
                 "error",
             )
 
-    def _check_update_shop_compat(self, config, current_shop, target_version, signal=None):
-        def log(msg, status="ok"):
+    def _check_update_shop_compat(
+        self, config: configparser.ConfigParser, current_shop: Optional[str], target_version: str, signal: Any = None
+    ) -> None:
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         if not config.has_section("compatibility"):
             return
@@ -2553,14 +1743,20 @@ class HealthCheckPage(QWidget):
                     "error",
                 )
 
-    def _check_mysql_version(self, config, current_mysql_ver, current_db_type, signal=None):
-        def log(msg, status="ok"):
+    def _check_mysql_version(
+        self,
+        config: configparser.ConfigParser,
+        current_mysql_ver: Optional[str],
+        current_db_type: Optional[str],
+        signal: Any = None,
+    ) -> None:
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         if not current_mysql_ver or not config.has_section("compatibility"):
             if current_db_type == "Client":
@@ -2612,27 +1808,27 @@ class HealthCheckPage(QWidget):
                 "warn",
             )
 
-    def _check_updated_files(self, conn, folder_path, signal=None):
+    def _check_updated_files(self, conn: Any, folder_path: str, signal: Any = None) -> bool:
         """Prüft Existenz und Schreibrechte der Dateien aus updated_files.txt."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
-            return
+        if self.worker and self.worker._is_cancelled:
+            return False
         self._emit_progress("Prüfe updated_files.txt...")
         txt_path = f"{folder_path}/updated_files.txt"
-        files_to_check = []
+        files_to_check: list[str] = []
         all_ok = True
         try:
             content = ""
             if isinstance(conn, ftplib.FTP):
                 r_io = io.BytesIO()
                 conn.retrbinary(f"RETR {txt_path}", r_io.write)
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return False
                 content = r_io.getvalue().decode("utf-8")
             else:
@@ -2643,7 +1839,7 @@ class HealthCheckPage(QWidget):
 
             for remote_file in files_to_check:
                 # Existenz prüfen
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return False
                 exists = False
                 try:
@@ -2661,7 +1857,7 @@ class HealthCheckPage(QWidget):
 
                 # Schreibrechte-Logik
                 is_admin = remote_file.startswith("admin/")
-                is_system = remote_file.startswith("system/") or remote_file.startswith("GXEngine/")
+                is_system = remote_file.startswith(("system/", "GXEngine/"))
 
                 # Einfache Prüfung: Versuchen für Append zu öffnen (nur bei Admin-Dateien)
                 if is_admin:
@@ -2683,16 +1879,16 @@ class HealthCheckPage(QWidget):
             log("updated_files.txt konnte nicht geprüft werden.", "warn")
             return False
 
-    def _check_files_to_delete(self, conn, folder_path, signal=None):
+    def _check_files_to_delete(self, conn: Any, folder_path: str, signal: Any = None) -> bool:
         """Prüft, ob Dateien aus to_delete.php noch existieren."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return True
         self._emit_progress("Prüfe to_delete.php...")
         php_path = f"{folder_path}/to_delete.php"
@@ -2702,7 +1898,7 @@ class HealthCheckPage(QWidget):
             if isinstance(conn, ftplib.FTP):
                 r_io = io.BytesIO()
                 conn.retrbinary(f"RETR {php_path}", r_io.write)
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return True
                 content = r_io.getvalue().decode("utf-8")
             else:
@@ -2714,7 +1910,7 @@ class HealthCheckPage(QWidget):
 
             for p in paths:
                 exists = False
-                if self.worker._is_cancelled:
+                if self.worker and self.worker._is_cancelled:
                     return True
                 try:
                     if isinstance(conn, ftplib.FTP):
@@ -2734,16 +1930,23 @@ class HealthCheckPage(QWidget):
         except:
             return True  # Falls Datei nicht existiert, gibt es wohl nichts zu löschen
 
-    def _evaluate_completeness(self, shop_ver, update_ver, files_ok, deleted_ok, signal=None):
+    def _evaluate_completeness(
+        self,
+        shop_ver: Optional[str],
+        update_ver: str,
+        files_ok: bool,
+        deleted_ok: bool,
+        signal: Any = None,
+    ) -> None:
         """Zusammenfassende Logik für Update-Status."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         self._emit_progress("Werte Update-Vollständigkeit aus...")
         s_tuple = self._parse_ver_tuple(shop_ver)
@@ -2771,16 +1974,16 @@ class HealthCheckPage(QWidget):
 
         log(msg, status)
 
-    def _check_integrity(self, files, signal=None):
+    def _check_integrity(self, files: list[str], signal: Any = None) -> None:
         """Prüft auf kritische Basis-Verzeichnisse und Dateien."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
                 self._add_result(msg, status)
 
-        if self.worker._is_cancelled:
+        if self.worker and self.worker._is_cancelled:
             return
         self._emit_progress("Prüfe Shop-Integrität...")
         critical = {
@@ -2790,7 +1993,7 @@ class HealthCheckPage(QWidget):
             "GXEngine": "Engine-Ordner fehlt.",
         }
         for item, msg in critical.items():
-            if self.worker._is_cancelled:
+            if self.worker and self.worker._is_cancelled:
                 return
             if item not in files:
                 self._emit_progress(f"Kritische Datei/Ordner fehlt: {item}")
@@ -2817,10 +2020,16 @@ class HealthCheckPage(QWidget):
         else:
             log("Basis-Integrität (Dateipräsenz): Fehler (index.php fehlt).", "error")
 
-    def _run_gxmodules_compatibility_scan(self, conn, gambio_ver, scan_gambio=False, signal=None):
+    def _run_gxmodules_compatibility_scan(
+        self,
+        conn: Any,
+        gambio_ver: Optional[str],
+        scan_gambio: bool = False,
+        signal: Any = None,
+    ) -> None:
         """Scans /GXModules for PHP 8 incompatibilities."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -2860,9 +2069,9 @@ class HealthCheckPage(QWidget):
                     )
                     return
 
-            php_files = []
+            php_files: list[str] = []
 
-            def walk_gxmodules(current_path):
+            def walk_gxmodules(current_path: str) -> None:
                 if self.worker and self.worker._is_cancelled:
                     return
                 try:
@@ -2877,9 +2086,10 @@ class HealthCheckPage(QWidget):
                                 full_path = f"{current_path}/{name}"
                                 if attrs.get("type") == "dir":
                                     walk_gxmodules(full_path)
-                                elif attrs.get("type") in ["file", "os.unix.slink", ""]:
-                                    if name.lower().endswith(".php"):
-                                        php_files.append(full_path)
+                                elif attrs.get("type") in ["file", "os.unix.slink", ""] and name.lower().endswith(
+                                    ".php"
+                                ):
+                                    php_files.append(full_path)
                         except:
                             try:
                                 names = conn.nlst(current_path)
@@ -2970,35 +2180,36 @@ class HealthCheckPage(QWidget):
                         content_str = content.decode("utf-8", errors="replace")
                         nodes = php_parser.parse(content_str, lexer=php_lexer.clone())
 
-                        def visit(node):
+                        def visit(node: object, target_issues: set[str]) -> None:
                             if not node:
                                 return
                             if isinstance(node, list):
                                 for n in node:
-                                    visit(n)
+                                    visit(n, target_issues)
                                 return
 
                             node_type = type(node).__name__
                             if node_type == "FunctionCall":
-                                if type(node.name).__name__ == "str":
-                                    func_name = node.name.lower()
+                                node_name = getattr(node, "name", None)
+                                if isinstance(node_name, str):
+                                    func_name = node_name.lower()
                                     if func_name in patterns:
-                                        issues.add(func_name)
+                                        target_issues.add(func_name)
                             elif node_type == "Class":
-                                class_name = node.name.lower()
+                                class_name = str(getattr(node, "name", "")).lower()
                                 methods = [m for m in getattr(node, "nodes", []) if type(m).__name__ == "Method"]
-                                has_construct = any(m.name.lower() == "__construct" for m in methods)
+                                has_construct = any(getattr(m, "name", "").lower() == "__construct" for m in methods)
                                 if not has_construct:
                                     for m in methods:
-                                        if m.name.lower() == class_name:
-                                            issues.add(f"Alter PHP4-Konstruktor ({node.name})")
+                                        if getattr(m, "name", "").lower() == class_name:
+                                            target_issues.add(f"Alter PHP4-Konstruktor ({getattr(node, 'name', '')})")
 
                             if hasattr(node, "__dict__"):
                                 for val in vars(node).values():
                                     if isinstance(val, list) or hasattr(val, "__dict__"):
-                                        visit(val)
+                                        visit(val, target_issues)
 
-                        visit(nodes)
+                        visit(nodes, issues)
                         ast_success = True
                     except Exception:
                         # Fallback to regex if parse fails
@@ -3014,9 +2225,8 @@ class HealthCheckPage(QWidget):
 
                     for class_name in class_matches:
                         func_pattern = re.compile(rb"\bfunction\s+" + class_name + rb"\s*\(", re.IGNORECASE)
-                        if func_pattern.search(content):
-                            if not has_modern_construct:
-                                issues.add(f"Alter PHP4-Konstruktor ({class_name.decode('utf-8', 'ignore')})")
+                        if func_pattern.search(content) and not has_modern_construct:
+                            issues.add(f"Alter PHP4-Konstruktor ({class_name.decode('utf-8', 'ignore')})")
 
                 if issues:
                     incompatibilities_found += 1
@@ -3041,17 +2251,22 @@ class HealthCheckPage(QWidget):
                 )
 
         except Exception as e:
-            log(f"Fehler bei GXModules Kompatibilitätsprüfung: {str(e)}", "error")
+            log(f"Fehler bei GXModules Kompatibilitätsprüfung: {e!s}", "error")
 
-    def showEvent(self, event):
+    def showEvent(self, event: QShowEvent) -> None:
         """Wird aufgerufen, wenn die Seite angezeigt wird."""
         super().showEvent(event)
         self._load_profiles()
 
-    def _get_php_compat_from_shop(self, conn, gambio_ver, signal=None):
+    def _get_php_compat_from_shop(
+        self,
+        conn: Any,
+        gambio_ver: Optional[str],
+        signal: Any = None,
+    ) -> tuple[Optional[str], Optional[str]]:
         """Liest die PHP-Kompatibilität dynamisch aus den Shop-Update-Dateien."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -3078,7 +2293,7 @@ class HealthCheckPage(QWidget):
                     )
                     return None, None
 
-            version_map = {}
+            version_map: dict[tuple[int, ...], str] = {}
             for f in update_folders:
                 if self.worker and self.worker._is_cancelled:
                     return None, None
@@ -3100,7 +2315,7 @@ class HealthCheckPage(QWidget):
                 log(f"Kompatibilitätsdaten im Ordner {target_folder} gefunden.", "ok")
             else:
                 # Suche nach der nächstkleineren Version
-                smaller_versions = [v for v in version_map.keys() if v <= g_tuple]
+                smaller_versions = [v for v in version_map if v <= g_tuple]
                 if smaller_versions:
                     closest_ver = max(smaller_versions)
                     target_folder = version_map[closest_ver]
@@ -3130,13 +2345,20 @@ class HealthCheckPage(QWidget):
             return None, None
 
         except Exception as e:
-            log(f"Fehler beim dynamischen Auslesen der Kompatibilität: {str(e)}", "warn")
+            log(f"Fehler beim dynamischen Auslesen der Kompatibilität: {e!s}", "warn")
             return None, None
 
-    def _run_php_compatibility_check_logic(self, gambio_ver, php_ver, min_php, max_php, signal=None):
+    def _run_php_compatibility_check_logic(
+        self,
+        gambio_ver: Optional[str],
+        php_ver: Optional[str],
+        min_php: Optional[str],
+        max_php: Optional[str],
+        signal: Any = None,
+    ) -> None:
         """Vergleicht die Gambio-Version mit der PHP-Version basierend auf dynamischen Daten."""
 
-        def log(msg, status="ok"):
+        def log(msg: str, status: str = "ok") -> None:
             if signal:
                 signal.emit(msg, status)
             else:
@@ -3179,7 +2401,7 @@ class HealthCheckPage(QWidget):
                 "error",
             )
 
-    def _export_html(self):
+    def _export_html(self) -> None:
         if not self.current_logger:
             show_error("Bitte zuerst einen Health-Check ausführen.")
             return
@@ -3200,7 +2422,7 @@ class HealthCheckPage(QWidget):
             else:
                 show_error("Fehler beim Erstellen des Berichts.")
 
-    def _export_pdf(self):
+    def _export_pdf(self) -> None:
         if not self.current_logger:
             show_error("Bitte zuerst einen Health-Check ausführen.")
             return
@@ -3221,7 +2443,7 @@ class HealthCheckPage(QWidget):
             else:
                 show_error("Fehler beim Erstellen des Berichts.")
 
-    def _check_cache_size(self, conn, remote_files, result_signal):
+    def _check_cache_size(self, conn: Any, remote_files: list[str], result_signal: Any) -> None:
         """Prüft die Größe der Cache-Ordner."""
         cache_dirs = ["cache", "templates_c"]
         total_size = 0
@@ -3270,8 +2492,8 @@ class ConfigPage(QWidget):
         self,
         auth_manager: MasterPasswordManager,
         config_manager: ConfigManager,
-        parent=None,
-    ):
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         self.auth_manager = auth_manager
         self.config_manager = config_manager
@@ -3280,7 +2502,7 @@ class ConfigPage(QWidget):
         self._setup_ui()
         self._load_profiles_into_combobox()
 
-    def _setup_ui(self):
+    def _setup_ui(self) -> None:
         main_layout = QVBoxLayout(self)
 
         # --- Shop-Profilverwaltung ---
@@ -3302,7 +2524,7 @@ class ConfigPage(QWidget):
         self.edit_port = QLineEdit()
         self.edit_username = QLineEdit()
         self.edit_password = QLineEdit()
-        self.edit_password.setEchoMode(QLineEdit.Password)
+        self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.btn_toggle_password = QPushButton("Anzeigen")
         self.btn_toggle_password.setFixedWidth(80)
         self.btn_toggle_password.clicked.connect(self._toggle_password_visibility)
@@ -3315,6 +2537,11 @@ class ConfigPage(QWidget):
         self.combo_protocol.currentTextChanged.connect(self._on_protocol_changed)
         self.edit_shop_url = QLineEdit()
         self.remote_path_input = QLineEdit()
+        self.chk_allow_insecure_ftp = QCheckBox("Unverschlüsseltes FTP (Klartext-Fallback) erlauben")
+        self.chk_allow_insecure_ftp.setToolTip(
+            "Standardmäßig wird für FTP eine sichere TLS-Verbindung (FTPS) erzwungen. "
+            "Aktivieren Sie diese Option nur, falls Ihr Server kein FTPS unterstützt (Legacy-Modus)."
+        )
 
         profile_form_layout.addRow("Shop-Name:", self.edit_shop_name)
         profile_form_layout.addRow("Host:", self.edit_host)
@@ -3322,6 +2549,7 @@ class ConfigPage(QWidget):
         profile_form_layout.addRow("Benutzername:", self.edit_username)
         profile_form_layout.addRow("Passwort:", password_layout)
         profile_form_layout.addRow("Protokoll:", self.combo_protocol)
+        profile_form_layout.addRow("Sicherheit:", self.chk_allow_insecure_ftp)
         profile_form_layout.addRow("Shop-URL (HTTPS):", self.edit_shop_url)
         profile_form_layout.addRow("Shop-Pfad (Server):", self.remote_path_input)
         profile_layout.addLayout(profile_form_layout)
@@ -3377,11 +2605,11 @@ class ConfigPage(QWidget):
         master_password_layout = QFormLayout(master_password_group)
 
         self.edit_old_master_password = QLineEdit()
-        self.edit_old_master_password.setEchoMode(QLineEdit.Password)
+        self.edit_old_master_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.edit_new_master_password = QLineEdit()
-        self.edit_new_master_password.setEchoMode(QLineEdit.Password)
+        self.edit_new_master_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.edit_repeat_new_master_password = QLineEdit()
-        self.edit_repeat_new_master_password.setEchoMode(QLineEdit.Password)
+        self.edit_repeat_new_master_password.setEchoMode(QLineEdit.EchoMode.Password)
 
         master_password_layout.addRow("Altes Passwort:", self.edit_old_master_password)
         master_password_layout.addRow("Neues Passwort:", self.edit_new_master_password)
@@ -3394,7 +2622,7 @@ class ConfigPage(QWidget):
         main_layout.addWidget(master_password_group)
         main_layout.addStretch()  # Schiebt den Inhalt nach oben
 
-    def _load_profiles_into_combobox(self):
+    def _load_profiles_into_combobox(self) -> None:
         """Lädt die Shop-Profile aus dem ConfigManager und füllt die Combobox."""
         self.combo_profiles.clear()
         try:
@@ -3420,12 +2648,12 @@ class ConfigPage(QWidget):
             show_error(str(e))
             self._handle_session_expired_for_profiles()
         except Exception as e:
-            show_error(f"Fehler beim Laden der Profile: {str(e)}")
+            show_error(f"Fehler beim Laden der Profile: {e!s}")
             self._handle_session_expired_for_profiles()  # Generic error handling for profiles
         finally:
             self.auth_manager.update_activity()
 
-    def _handle_session_expired_for_profiles(self):
+    def _handle_session_expired_for_profiles(self) -> None:
         """Hilfsfunktion zur Behandlung abgelaufener Sessions oder Fehler beim Laden von Profilen."""
         self._clear_profile_fields()
         self.combo_profiles.clear()
@@ -3434,7 +2662,7 @@ class ConfigPage(QWidget):
         self.btn_delete_profile.setEnabled(False)
         self.btn_save_profile.setEnabled(False)
 
-    def _on_profile_selected(self, index: int):
+    def _on_profile_selected(self, index: int) -> None:
         """Wird aufgerufen, wenn ein Profil in der Combobox ausgewählt wird."""
         self.auth_manager.update_activity()  # Aktivität bei Auswahländerung aktualisieren
         if index < 0 or self.combo_profiles.itemText(index) in [
@@ -3460,13 +2688,13 @@ class ConfigPage(QWidget):
             self._clear_profile_fields()
             self.current_profile_index = -1
         except Exception as e:
-            show_error(f"Fehler beim Laden des Profils: {str(e)}")
+            show_error(f"Fehler beim Laden des Profils: {e!s}")
             self._clear_profile_fields()
             self.current_profile_index = -1
         finally:
             self.auth_manager.update_activity()
 
-    def _get_current_profile_data(self) -> dict:
+    def _get_current_profile_data(self) -> dict[str, Any]:
         """Sammelt die Daten aus den Eingabefeldern und gibt sie als Diktat zurück."""
         port_text = self.edit_port.text().strip()
         protocol = self.combo_protocol.currentText()
@@ -3483,45 +2711,48 @@ class ConfigPage(QWidget):
             "protocol": protocol,
             "shop_url": self.edit_shop_url.text().strip(),
             "remote_path": self.remote_path_input.text().strip(),
+            "allow_insecure_ftp": self.chk_allow_insecure_ftp.isChecked(),
         }
 
-    def _toggle_password_visibility(self):
+    def _toggle_password_visibility(self) -> None:
         """Schaltet die Anzeige des Passworts zwischen Klartext und Maskierung um."""
-        if self.edit_password.echoMode() == QLineEdit.Password:
-            self.edit_password.setEchoMode(QLineEdit.Normal)
+        if self.edit_password.echoMode() == QLineEdit.EchoMode.Password:
+            self.edit_password.setEchoMode(QLineEdit.EchoMode.Normal)
             self.btn_toggle_password.setText("Verbergen")
         else:
-            self.edit_password.setEchoMode(QLineEdit.Password)
+            self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
             self.btn_toggle_password.setText("Anzeigen")
 
-    def _set_profile_data(self, profile_data: dict):
+    def _set_profile_data(self, profile_data: dict[str, Any]) -> None:
         """Setzt die Daten in die Eingabefelder."""
         self.edit_shop_name.setText(profile_data.get("shop_name", ""))
         self.edit_host.setText(profile_data.get("host", ""))
         self.edit_port.setText(str(profile_data.get("port", "")))
         self.edit_username.setText(profile_data.get("username", ""))
         self.edit_password.setText(profile_data.get("password", ""))
-        self.edit_password.setEchoMode(QLineEdit.Password)
+        self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.btn_toggle_password.setText("Anzeigen")
         self.combo_protocol.setCurrentText(profile_data.get("protocol", "FTP"))
         self.edit_shop_url.setText(profile_data.get("shop_url", ""))
         self.remote_path_input.setText(profile_data.get("remote_path", ""))
+        self.chk_allow_insecure_ftp.setChecked(bool(profile_data.get("allow_insecure_ftp", False)))
 
-    def _clear_profile_fields(self):
+    def _clear_profile_fields(self) -> None:
         """Löscht den Inhalt aller Shop-Profil-Eingabefelder."""
         self.edit_shop_name.clear()
         self.edit_host.clear()
         self.edit_port.clear()
         self.edit_username.clear()
         self.edit_password.clear()
-        self.edit_password.setEchoMode(QLineEdit.Password)
+        self.edit_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.btn_toggle_password.setText("Anzeigen")
         self.combo_protocol.setCurrentIndex(0)  # Auf FTP zurücksetzen
         self.edit_shop_url.clear()
         self.remote_path_input.clear()
+        self.chk_allow_insecure_ftp.setChecked(False)
         self.current_profile_index = -1
 
-    def _on_protocol_changed(self, protocol_name: str):
+    def _on_protocol_changed(self, protocol_name: str) -> None:
         """Passt den Standard-Port automatisch an, wenn das Protokoll gewechselt wird."""
         current_port = self.edit_port.text().strip()
         if protocol_name == "FTP" and current_port in ["22", "", "0"]:
@@ -3529,32 +2760,13 @@ class ConfigPage(QWidget):
         elif protocol_name == "SFTP" and current_port in ["21", "", "0"]:
             self.edit_port.setText("22")
 
-    def _test_connection(self):
+    def _test_connection(self) -> None:
         """Prüft die FTP/SFTP-Verbindung und sucht nach Gambio-Indikatoren."""
         try:
             self.auth_manager.require_active_session()
             data = self._get_current_profile_data()
 
             protocol = data.get("protocol", "FTP")
-            raw_host = str(data.get("host", "")).strip()
-            host = re.sub(r"^[a-zA-Z]+://", "", raw_host).strip("/")
-
-            raw_port = data.get("port")
-            try:
-                port = int(raw_port)
-                if port <= 0:
-                    port = 22 if protocol == "SFTP" else 21
-            except (ValueError, TypeError):
-                port = 22 if protocol == "SFTP" else 21
-
-            user = str(data.get("username", "")).strip()
-            pwd = data.get("password", "")
-            remote_path = data.get("remote_path", "").strip()
-
-            if not host or not user:
-                show_error("Bitte Host und Benutzername ausfüllen.")
-                return
-
             if protocol == "HTTPS":
                 QMessageBox.information(
                     self,
@@ -3563,87 +2775,33 @@ class ConfigPage(QWidget):
                 )
                 return
 
-            found_files = []
-            version_info = ""
+            if not data.get("host") or not data.get("username"):
+                show_error("Bitte Host und Benutzername ausfüllen.")
+                return
 
-            if protocol == "FTP":
-                use_tls = False
-                try:
-                    ftp = ftplib.FTP_TLS()
-                    ftp.connect(host, port, timeout=15)
-                    ftp.auth()
-                    use_tls = True
-                except Exception:
-                    ftp = ftplib.FTP()
-                    ftp.connect(host, port, timeout=15)
+            res = NetworkService.test_connection(data)
+            if not res["success"]:
+                err_msg = res.get("error") or "Unbekannter Verbindungsfehler."
+                if "Authentication failed" in err_msg:
+                    show_error(f"{protocol}-Verbindung fehlgeschlagen:\nLogin/Passwort falsch.")
+                elif "Connection timed out" in err_msg or "timed out" in err_msg:
+                    show_error(
+                        f"{protocol}-Verbindung fehlgeschlagen:\nHost nicht erreichbar (Timeout). Bitte Port und Firewall prüfen."
+                    )
+                elif "Error reading SSH protocol banner" in err_msg:
+                    show_error(
+                        "SFTP-Verbindung fehlgeschlagen:\nDer Server lieferte kein SSH-Protokollbanner. Möglicherweise läuft auf Port normales FTP statt SFTP."
+                    )
+                else:
+                    show_error(f"{protocol}-Verbindung fehlgeschlagen:\n{err_msg}")
+                return
 
-                try:
-                    ftp.trust_server_pasv_ipv4_address = True
-                    ftp.login(user, pwd)
-                    if use_tls:
-                        try:
-                            ftp.prot_p()
-                        except Exception:
-                            pass
-                    if remote_path:
-                        ftp.cwd(remote_path)
-                    found_files = ftp.nlst()
+            host = res["host"]
+            port = res["port"]
+            remote_path = res["remote_path"]
+            version_info = f"\nErkannte Version: {res['version']}" if res.get("version") else ""
 
-                    # Optional: Version auslesen
-                    try:
-                        r_file = io.BytesIO()
-                        ftp.retrbinary("RETR system/conf/main.conf.php", r_file.write)
-                        content = r_file.getvalue().decode("utf-8", errors="ignore")
-                        match = re.search(r"'PROJECT_VERSION'\s*=>\s*'([^']+)'", content)
-                        if match:
-                            version_info = f"\nErkannte Version: {match.group(1)}"
-                    except Exception:
-                        pass
-                finally:
-                    try:
-                        ftp.quit()
-                    except Exception:
-                        try:
-                            ftp.close()
-                        except Exception:
-                            pass
-
-            elif protocol == "SFTP":
-                if paramiko is None:
-                    show_error("SFTP-Unterstützung nicht installiert (paramiko fehlt).")
-                    return
-
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(host, port, user, pwd, timeout=15)
-                sftp = ssh.open_sftp()
-                if remote_path:
-                    sftp.chdir(remote_path)
-                found_files = sftp.listdir()
-
-                # Optional: Version auslesen
-                try:
-                    with sftp.open("system/conf/main.conf.php", "r") as f:
-                        content = f.read().decode("utf-8", errors="ignore")
-                        match = re.search(r"'PROJECT_VERSION'\s*=>\s*'([^']+)'", content)
-                        if match:
-                            version_info = f"\nErkannte Version: {match.group(1)}"
-                except Exception:
-                    pass
-                sftp.close()
-                ssh.close()
-
-            # Gambio Erkennung
-            gambio_indicators = [
-                "system",
-                "GXEngine",
-                "templates",
-                "admin",
-                "version.info",
-            ]
-            shop_detected = any(ind in found_files for ind in gambio_indicators)
-
-            if shop_detected:
+            if res["shop_detected"]:
                 QMessageBox.information(
                     self,
                     "Erfolg",
@@ -3657,33 +2815,19 @@ class ConfigPage(QWidget):
 
         except SessionExpiredError as e:
             show_error(str(e))
-        except ftplib.all_errors as e:
-            show_error(f"FTP-Verbindung zu {host}:{port} fehlgeschlagen:\n{str(e)}")
         except Exception as e:
-            err_msg = str(e)
-            if "Authentication failed" in err_msg:
-                show_error(f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\nLogin/Passwort falsch.")
-            elif "Connection timed out" in err_msg or "timed out" in err_msg:
-                show_error(
-                    f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\nHost nicht erreichbar (Timeout). Bitte Port ({port}) und Firewall prüfen."
-                )
-            elif "Error reading SSH protocol banner" in err_msg:
-                show_error(
-                    f"SFTP-Verbindung zu {host}:{port} fehlgeschlagen:\nDer Server lieferte kein SSH-Protokollbanner. Möglicherweise läuft auf Port {port} normales FTP statt SFTP."
-                )
-            else:
-                show_error(f"{protocol}-Verbindung zu {host}:{port} fehlgeschlagen:\n{err_msg}")
+            show_error(f"Unerwarteter Fehler beim Verbindungstest: {e!s}")
         finally:
             self.auth_manager.update_activity()
 
-    def _new_profile(self):
+    def _new_profile(self) -> None:
         """Bereitet die Oberfläche für die Eingabe eines neuen Profils vor."""
         self.auth_manager.update_activity()
         self._clear_profile_fields()
         self.combo_profiles.setCurrentIndex(-1)  # Kein Profil auswählen
         self.btn_save_profile.setEnabled(True)  # Speichern für neues Profil aktivieren
 
-    def _save_profile(self):
+    def _save_profile(self) -> None:
         """Speichert das aktuell angezeigte oder neu erstellte Profil."""
         try:
             self.auth_manager.require_active_session()
@@ -3699,11 +2843,10 @@ class ConfigPage(QWidget):
 
             # Validierung des Shop-Pfads
             remote_path = profile_data.get("remote_path", "").strip()
-            if remote_path:
-                # Verhindere Directory Traversal (Sicherheitsrisiko)
-                if ".." in remote_path or "\\" in remote_path:
-                    show_error("Der angegebene Shop-Pfad auf dem Server ist ungültig.")
-                    return
+            # Verhindere Directory Traversal (Sicherheitsrisiko)
+            if remote_path and (".." in remote_path or "\\" in remote_path):
+                show_error("Der angegebene Shop-Pfad auf dem Server ist ungültig.")
+                return
 
             profiles = self.config_manager.get_profiles()
             if self.current_profile_index != -1 and 0 <= self.current_profile_index < len(profiles):
@@ -3726,11 +2869,11 @@ class ConfigPage(QWidget):
         except SessionExpiredError as e:
             show_error(str(e))
         except Exception as e:
-            show_error(f"Fehler beim Speichern des Profils: {str(e)}")
+            show_error(f"Fehler beim Speichern des Profils: {e!s}")
         finally:
             self.auth_manager.update_activity()
 
-    def _delete_profile(self):
+    def _delete_profile(self) -> None:
         """Löscht das aktuell ausgewählte Profil."""
         try:
             self.auth_manager.require_active_session()
@@ -3747,9 +2890,9 @@ class ConfigPage(QWidget):
                 self,
                 "Profil löschen",
                 f"Möchten Sie das Profil '{self.combo_profiles.currentText()}' wirklich löschen?",
-                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 profiles = self.config_manager.get_profiles()
                 if 0 <= self.current_profile_index < len(profiles):
                     del profiles[self.current_profile_index]
@@ -3763,11 +2906,11 @@ class ConfigPage(QWidget):
         except SessionExpiredError as e:
             show_error(str(e))
         except Exception as e:
-            show_error(f"Fehler beim Löschen des Profils: {str(e)}")
+            show_error(f"Fehler beim Löschen des Profils: {e!s}")
         finally:
             self.auth_manager.update_activity()
 
-    def _save_general_settings(self):
+    def _save_general_settings(self) -> None:
         """Speichert die allgemeinen Einstellungen (z.B. Ignorierte Dateien)."""
         try:
             self.auth_manager.require_active_session()
@@ -3784,11 +2927,11 @@ class ConfigPage(QWidget):
         except SessionExpiredError as e:
             show_error(str(e))
         except Exception as e:
-            show_error(f"Fehler beim Speichern der Einstellungen: {str(e)}")
+            show_error(f"Fehler beim Speichern der Einstellungen: {e!s}")
         finally:
             self.auth_manager.update_activity()
 
-    def _change_master_password(self):
+    def _change_master_password(self) -> None:
         """Ändert das Master-Passwort der Anwendung."""
         try:
             self.auth_manager.require_active_session()
@@ -3829,7 +2972,12 @@ class ConfigPage(QWidget):
 class UpdateAnalysisPage(QWidget):
     """Platzhalter-Widget für die Update-Analyse."""
 
-    def __init__(self, auth_manager, config_manager, parent=None):
+    def __init__(
+        self,
+        auth_manager: MasterPasswordManager,
+        config_manager: ConfigManager,
+        parent: Optional[QWidget] = None,
+    ) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Inhalt für Update-Analyse"))
@@ -3839,7 +2987,7 @@ class UpdateAnalysisPage(QWidget):
 class ManualPage(QWidget):
     """Zeigt das Benutzerhandbuch direkt in der Software an."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
 
@@ -3881,7 +3029,7 @@ class ManualPage(QWidget):
         self.btn_search_next.clicked.connect(self._search_next)
         self.btn_search_prev.clicked.connect(self._search_prev)
 
-    def _search_next(self):
+    def _search_next(self) -> None:
         text = self.search_input.text()
         if text:
             from PySide6.QtGui import QTextCursor
@@ -3890,19 +3038,19 @@ class ManualPage(QWidget):
             found = self.browser.find(text)
             if not found:
                 # Am Ende angekommen, cursor zurücksetzen
-                self.browser.moveCursor(QTextCursor.Start)
+                self.browser.moveCursor(QTextCursor.MoveOperation.Start)
                 self.browser.find(text)
 
-    def _search_prev(self):
+    def _search_prev(self) -> None:
         text = self.search_input.text()
         if text:
-            from PySide6.QtGui import QTextDocument, QTextCursor
+            from PySide6.QtGui import QTextCursor, QTextDocument
 
-            found = self.browser.find(text, QTextDocument.FindBackward)
+            found = self.browser.find(text, QTextDocument.FindFlag.FindBackward)
             if not found:
                 # Am Anfang angekommen, cursor ans Ende setzen
-                self.browser.moveCursor(QTextCursor.End)
-                self.browser.find(text, QTextDocument.FindBackward)
+                self.browser.moveCursor(QTextCursor.MoveOperation.End)
+                self.browser.find(text, QTextDocument.FindFlag.FindBackward)
 
 
 class MainWindow(QMainWindow):
@@ -3999,7 +3147,7 @@ class MainWindow(QMainWindow):
         donate_btn.setStyleSheet(
             "background-color: #f39c12; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;"
         )
-        donate_btn.setCursor(Qt.PointingHandCursor)
+        donate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         donate_btn.clicked.connect(lambda: webbrowser.open("https://paypal.me/kaischoelzke"))
         bottom_bar.addWidget(donate_btn)
 
@@ -4013,14 +3161,14 @@ class MainWindow(QMainWindow):
         self.btn_config.clicked.connect(lambda: self._change_page(2))
         self.btn_manual.clicked.connect(lambda: self._change_page(3))
 
-    def _cancel_all_operations(self):
+    def _cancel_all_operations(self) -> None:
         """Bricht global alle laufenden Aktionen auf allen Seiten ab."""
         for i in range(self.pages.count()):
             page = self.pages.widget(i)
             if hasattr(page, "cancel_all"):
                 page.cancel_all()
 
-    def _change_page(self, index: int):
+    def _change_page(self, index: int) -> None:
         """
         Wechselt die angezeigte Seite im QStackedWidget.
         Führt vor dem Wechsel eine Session-Prüfung und ggf. Re-Authentifizierung durch.
@@ -4041,8 +3189,9 @@ class MainWindow(QMainWindow):
                             self.pages.setCurrentIndex(index)
 
                             # Wenn die ConfigPage das Ziel ist, muss sie ihre Ansicht aktualisieren
-                            if isinstance(self.pages.widget(index), ConfigPage):
-                                self.pages.widget(index)._load_profiles_into_combobox()
+                            current_page = self.pages.widget(index)
+                            if isinstance(current_page, ConfigPage):
+                                current_page._load_profiles_into_combobox()
                         except (
                             InvalidMasterPasswordError,
                             TooManyFailedAttemptsError,
@@ -4060,8 +3209,9 @@ class MainWindow(QMainWindow):
                 self.pages.setCurrentIndex(index)
 
                 # Wenn die ConfigPage das Ziel ist, muss sie ihre Ansicht aktualisieren
-                if isinstance(self.pages.widget(index), ConfigPage):
-                    self.pages.widget(index)._load_profiles_into_combobox()
+                current_page = self.pages.widget(index)
+                if isinstance(current_page, ConfigPage):
+                    current_page._load_profiles_into_combobox()
         except Exception as e:
             # Unerwartete Fehler während des Prozesses abfangen
             show_error(f"Ein unerwarteter Fehler ist aufgetreten: {type(e).__name__}: {e}")

@@ -63,7 +63,10 @@ class SensitiveFilter(logging.Filter):
                 record.args = ()
             else:
                 record.msg = sanitize_sensitive_data(str(record.msg))
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
+            record.msg = sanitize_sensitive_data(str(record.msg))
+        except Exception:  # noqa: BLE001
+            # Ein Logging-Filter darf niemals die aufrufende Anwendung zum Absturz bringen
             record.msg = sanitize_sensitive_data(str(record.msg))
 
         return True
@@ -71,7 +74,7 @@ class SensitiveFilter(logging.Filter):
 
 def setup_logging(
     level: int = logging.INFO,
-    log_format: Optional[str] = None,
+    log_format: str | None = None,
 ) -> None:
     """
     Initialisiert die globale Logging-Konfiguration idempotent.

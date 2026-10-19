@@ -217,7 +217,7 @@ class TestVersionCheckCLI:
         assert ver == "2.0.0"
         assert 'SOFTWARE_VERSION = "2.0.0"' in app_file.read_text(encoding="utf-8")
 
-    def test_parse_arguments(self):
+    def test_parse_arguments(self) -> None:
         with patch.object(
             build.sys,
             "argv",
@@ -228,3 +228,215 @@ class TestVersionCheckCLI:
             assert args.non_interactive is True
             assert args.bump_version == "3.0.0"
             assert args.clean_only is False
+
+
+class TestQualityGate:
+    """Tests für die Quality Gate Prüfroutinen und Phasen."""
+
+    def test_run_check_success(self) -> None:
+        with patch("build.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            build._run_check("Test Label", ["dummy", "cmd"])
+            mock_run.assert_called_once_with(["dummy", "cmd"])
+
+    def test_run_check_failure_exits(self) -> None:
+        with patch("build.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=2)
+            with pytest.raises(SystemExit) as exc_info:
+                build._run_check("Fail Label", ["failing", "cmd"])
+            assert exc_info.value.code == 1
+
+    def test_run_check_os_error_exits(self) -> None:
+        with patch("build.subprocess.run", side_effect=OSError("Command not found")):
+            with pytest.raises(SystemExit) as exc_info:
+                build._run_check("Error Label", ["missing", "cmd"])
+            assert exc_info.value.code == 1
+
+    def test_all_phases_called_in_run_quality_gate(self) -> None:
+        with patch("build._run_check") as mock_run_check:
+            build.run_quality_gate()
+            assert mock_run_check.call_count == 4
+
+
+class TestCythonAndProcessUtilities:
+    """Tests für Cython-Erweiterungen und Prozessbeendigung."""
+
+    def test_create_cython_extensions(self, tmp_path: Path) -> None:
+        file1 = tmp_path / "core" / "engine.py"
+        file1.parent.mkdir(parents=True)
+        file1.write_text("#", encoding="utf-8")
+
+        with patch("build.BASE_DIR", tmp_path):
+            exts = build.create_cython_extensions([str(file1)])
+            assert len(exts) == 1
+            assert exts[0].name == "core.engine"
+
+    def test_kill_process_if_running_windows(self) -> None:
+        with (
+            patch("build.platform.system", return_value="Windows"),
+            patch("build.subprocess.run") as mock_run,
+            patch("build.time.sleep"),
+        ):
+            build.kill_process_if_running("HealthCheckModul")
+            mock_run.assert_called_once_with(
+                ["taskkill", "/F", "/IM", "HealthCheckModul.exe"],
+                check=False,
+                stdout=build.subprocess.DEVNULL,
+                stderr=build.subprocess.DEVNULL,
+            )
+
+    def test_kill_process_if_running_non_windows(self) -> None:
+        with (
+            patch("build.platform.system", return_value="Linux"),
+            patch("build.subprocess.run") as mock_run,
+        ):
+            build.kill_process_if_running("HealthCheckModul")
+            mock_run.assert_not_called()
+
+    def test_kill_process_handles_os_error(self) -> None:
+        with (
+            patch("build.platform.system", return_value="Windows"),
+            patch("build.subprocess.run", side_effect=OSError("Access denied")),
+        ):
+            build.kill_process_if_running("TestApp")
+
+
+class TestBuildMainAndPipelines:
+    """Tests für main() CLI und Build-Pipelines."""
+
+    def test_main_clean_only(self) -> None:
+        with (
+            patch("build.parse_arguments") as mock_args,
+            patch("build.cleanup_build_files") as mock_clean,
+        ):
+            mock_args.return_value = MagicMock(clean_only=True)
+            build.main()
+            mock_clean.assert_called_once()
+
+    def test_main_full_flow_skip_quality_gate(self, tmp_path: Path) -> None:
+        with (
+            patch("build.parse_arguments") as mock_args,
+            patch("build.run_quality_gate") as mock_qg,
+            patch("build.perform_version_check", return_value="2.0.0"),
+            patch("build.run_build_process") as mock_build,
+            patch("build.create_final_package") as mock_pkg,
+        ):
+            mock_args.return_value = MagicMock(
+                clean_only=False,
+                skip_quality_gate=True,
+                non_interactive=True,
+                bump_version="2.0.0",
+            )
+            build.main()
+            mock_qg.assert_not_called()
+            mock_build.assert_called_once()
+            mock_pkg.assert_called_once_with(build.DIST_DIR, "2.0.0")
+
+    def test_perform_version_check_interactive_no_changes_declined(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app_file = tmp_path / "app.py"
+        app_file.write_text('SOFTWARE_VERSION = "1.0.0"\n', encoding="utf-8")
+        monkeypatch.setattr(build, "APP_UTILS_FILE", app_file)
+        monkeypatch.setattr(build, "SNAPSHOT_FILE", tmp_path / ".snap.json")
+
+        build.save_snapshot(build.get_current_snapshot(tmp_path), tmp_path / ".snap.json")
+
+        with patch("builtins.input", return_value="n"):
+            ver = build.perform_version_check(interactive=True, base_dir=tmp_path)
+            assert ver == "1.0.0"
+
+    def test_perform_version_check_interactive_changes_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app_file = tmp_path / "app.py"
+        app_file.write_text('SOFTWARE_VERSION = "1.0.0"\n', encoding="utf-8")
+        readme = tmp_path / "README.md"
+        readme.write_text("v1.0.0\n", encoding="utf-8")
+
+        monkeypatch.setattr(build, "APP_UTILS_FILE", app_file)
+        monkeypatch.setattr(build, "README_FILE", readme)
+        monkeypatch.setattr(build, "SNAPSHOT_FILE", tmp_path / ".snap.json")
+
+        build.save_snapshot({}, tmp_path / ".snap.json")
+
+        with patch("builtins.input", side_effect=["1.0.1", "j"]):
+            ver = build.perform_version_check(interactive=True, base_dir=tmp_path)
+            assert ver == "1.0.1"
+            assert 'SOFTWARE_VERSION = "1.0.1"' in app_file.read_text(encoding="utf-8")
+
+    def test_run_build_process_success(self, tmp_path: Path) -> None:
+        targets = [{"main_script": "app.py", "app_name": "TestApp", "windowed": True}]
+        dist = tmp_path / "dist"
+        work = tmp_path / "work"
+
+        with (
+            patch("build.kill_process_if_running"),
+            patch("build.cleanup_build_files"),
+            patch("build.find_all_python_files", return_value=[str(tmp_path / "core.py")]),
+            patch("build.create_cython_extensions", return_value=[]),
+            patch("setuptools.setup") as mock_setup,
+            patch("build.create_pyinstaller_command", return_value=["pyinstaller", "dummy"]),
+            patch("build.subprocess.check_call") as mock_call,
+            patch("build.final_cleanup"),
+        ):
+            build.run_build_process(targets, dist_dir=dist, work_dir=work)
+            mock_setup.assert_called_once()
+            mock_call.assert_called_once_with(["pyinstaller", "dummy"])
+
+    def test_run_build_process_failure_exits(self, tmp_path: Path) -> None:
+        targets = [{"main_script": "app.py", "app_name": "TestApp", "windowed": True}]
+        dist = tmp_path / "dist"
+        work = tmp_path / "work"
+
+        with (
+            patch("build.kill_process_if_running"),
+            patch("build.cleanup_build_files"),
+            patch("build.find_all_python_files", return_value=[]),
+            patch("build.subprocess.check_call", side_effect=RuntimeError("PyInstaller failed")),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                build.run_build_process(targets, dist_dir=dist, work_dir=work)
+            assert exc_info.value.code == 1
+
+    def test_main_runs_quality_gate_by_default(self) -> None:
+        with (
+            patch("build.parse_arguments") as mock_args,
+            patch("build.run_quality_gate") as mock_qg,
+            patch("build.perform_version_check", return_value="1.0.0"),
+            patch("build.run_build_process"),
+            patch("build.create_final_package"),
+        ):
+            mock_args.return_value = MagicMock(
+                clean_only=False,
+                skip_quality_gate=False,
+                non_interactive=True,
+                bump_version=None,
+            )
+            build.main()
+            mock_qg.assert_called_once()
+
+    def test_create_final_package_windows_explorer(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        dist_dir = tmp_path / "dist"
+        app_dir = dist_dir / "HealthCheckModul"
+        app_dir.mkdir(parents=True)
+        (app_dir / "HealthCheckModul.exe").write_text("binary", encoding="utf-8")
+
+        monkeypatch.setattr(build, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(build.platform, "system", lambda: "Windows")
+
+        with patch("build.subprocess.run") as mock_run:
+            zip_res = build.create_final_package(dist_dir, "1.0.0")
+            assert zip_res is not None
+            mock_run.assert_called_once()
+            assert "explorer" in mock_run.call_args[0][0]
+
+    def test_create_final_package_os_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        dist_dir = tmp_path / "dist"
+        app_dir = dist_dir / "HealthCheckModul"
+        app_dir.mkdir(parents=True)
+
+        monkeypatch.setattr(build, "BASE_DIR", tmp_path)
+        with patch("shutil.copytree", side_effect=OSError("Disk full")):
+            result = build.create_final_package(dist_dir, "1.0.0")
+            assert result is None

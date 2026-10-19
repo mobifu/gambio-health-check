@@ -13,9 +13,9 @@ from core.reporting import (
 )
 
 __all__ = [
+    "MAX_REPORT_ENTRIES",
     "HashCheckEngine",
     "HealthCheckLogger",
-    "MAX_REPORT_ENTRIES",
     "generate_html_report",
     "generate_pdf_report",
     "load_log_entries",

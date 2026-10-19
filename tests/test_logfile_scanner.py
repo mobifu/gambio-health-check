@@ -1,10 +1,11 @@
-import pytest
-from unittest.mock import MagicMock
 import datetime
 import ftplib
 
 # Mock UI classes and modules to import main_window
 import sys
+from unittest.mock import MagicMock
+
+import pytest
 from PySide6.QtWidgets import QApplication
 
 if not QApplication.instance():

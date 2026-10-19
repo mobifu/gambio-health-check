@@ -30,12 +30,15 @@ Im Gegensatz zu Cloud-basierten Lösungen arbeitet dieses Tool vollständig **lo
     > **Sicherheitsmechanismus (Backup-Zwang):** Um versehentliche Datenverluste zu vermeiden, müssen Anwender über eine Checkbox explizit bestätigen, dass ein aktuelles Backup (Dateien und Datenbank) angefertigt wurde, bevor Löschfunktionen freigeschaltet werden.
 *   **Whitelist-System:** Konfigurierbare Liste für Dateien, die niemals automatisch gelöscht werden dürfen (z.B. `paypal3.php`).
 *   **Verschlüsselte Konfiguration & Profil-Verwaltung:** Speicherung von Shop-Profilen in einer gesicherten AES-verschlüsselten Datei mit atomarem Schreibzyklus, automatischer Bereinigung temporärer Dateien im Fehlerfall, Typvalidierung und Abwärtskompatibilität durch automatisches Default-Merging. Die getroffene Profil-Auswahl bleibt auch bei Neustarts der Anwendung und Seitenwechseln (z. B. zur Konfiguration) dauerhaft erhalten. Zur einfachen Überprüfung hinterlegter Zugangsdaten kann das Passwort über eine Schaltfläche („Anzeigen“ / „Verbergen“) im Klartext eingeblendet werden.
-*   **FTP über TLS (FTPS) & Passivmodus:** Automatische Aushandlung von explizitem TLS (`FTPS` / `PROT P`) mit Fallback auf Standard-FTP. Unterstützung von dynamischen PASV-IPs bei Cluster- und Webhosting-Servern (`trust_server_pasv_ipv4_address`), um Timeouts beim Auflisten von Shop-Verzeichnissen zuverlässig zu verhindern.
+*   **FTP über TLS (FTPS) & gehärteter Klartext-Fallback:** Standardmäßig wird bei FTP-Verbindungen zwingend eine sichere Verbindung via `FTPS` (`FTP_TLS` mit Datenkanal-Verschlüsselung `PROT P`) erzwungen. Schlägt der TLS-Handshake fehl, wird ein unverschlüsselter Klartext-Fallback aus Sicherheitsgründen standardmäßig blockiert (`InsecureFTPError`). Über eine explizite Option im Shop-Profil („Unverschlüsseltes FTP (Klartext-Fallback) erlauben“) kann der Anwender bei Bedarf Legacy-Server autorisieren. Unterstützung von dynamischen PASV-IPs bei Cluster- und Webhosting-Servern (`trust_server_pasv_ipv4_address`).
 *   **Strukturiertes Core-Subsystem:**
     * `core.hash_engine.HashCheckEngine`: Robuste Hash-Berechnung (SHA-256) über FTP/SFTP, UTF-8-Encoding, Directory-Traversal-Schutz und Malware-Heuristiken.
     * `core.logger.HealthCheckLogger`: Thread-sicheres JSON-Lines-Logging mit Profil-Isolation, Path-Traversal-Schutz (`pathlib.Path.resolve()`) und Context-Manager-Unterstützung (`with HealthCheckLogger(...)`).
     * `core.reporting`: Export strukturierter HTML- und PDF-Berichte mit robuster Entkopplung (`load_log_entries`), DoS-Begrenzung (`MAX_REPORT_ENTRIES`), strikter Content-Security-Policy (`default-src 'none'`), durchgängigem XSS-Escaping (`html.escape`), Statistik-Karten und Status-Farbcodierung.
-*   **Moderne GUI & UI-Architektur:** Benutzerfreundliche Oberfläche basierend auf **PySide6**:
+*   **Moderne GUI & UI-Architektur:** Benutzerfreundliche Oberfläche basierend auf **PySide6** mit vollständiger Service-Modularisierung:
+    * `ui.network_service.NetworkService`: Zentralisiert die Netzwerk- und Protokoll-Logik (FTP/FTPS/SFTP), Verbindungstests, Gambio-Versionserkennung und Ressourcenfreigabe.
+    * `ui.network_service.RemoteFileService`: Kapselt rekursive Remote-Operationen (sicheres Löschen von Dateien/Ordnern, Cache-Bereinigung, `.bak`-Suche, Logfile-Leseoperationen).
+    * `ui.workers`: Eigenständiges Modul für alle `QThread`-Hintergrund-Worker (`HealthCheckWorker`, `LegacyDeleteWorker`, `BakFileScannerWorker`, `LogfileWorker`), entkoppelt von der GUI-Ebene für maximale Testbarkeit.
     * `ui.dialogs`: Vollständig typisierte Dialoge für Master-Passwort-Abfrage, Shop-Profil-Verwaltung mit automatischer Port-Anpassung je Protokoll (FTP/SFTP/HTTPS), Eingabevalidierung sowie modale Fehler-, Info- und Bestätigungsdialoge (`ask_confirmation`).
     * `ui.backup_manager.BackupManager`: Lokales ZIP-Backup-Management mit atomarer Archivierung, Metadaten-Auflistung, Zeitstempeln und striktem Schutz vor Directory Traversal und Zip-Slip-Attacken (`pathlib.Path.resolve()`).
     * `ui.backup_actions.BackupActions`: Sichere Download-Routinen zur Vorab-Sicherung entfernter Dateien vor Bereinigungsaktionen.
@@ -52,8 +55,8 @@ Sicherheit steht bei diesem Tool an erster Stelle:
 *   **Brute-Force-Schutz:** Exponentielle Zeitverzögerung bei falschen Passworteingaben (2s bis 32s) und automatischer Lockout nach 10 Fehlversuchen über [security/master_password.py](file:///c:/E/python/Health-Check-Modul/security/master_password.py).
 *   **Kein Klartext:** Passwörter werden niemals im Klartext auf der Festplatte gespeichert oder geloggt. Beim Löschen (`clear()`) bzw. Session-Ablauf wird der Speicherbereich im RAM explizit überschrieben und dereferenziert.
 *   **Session-Lock & Aktivitätsüberwachung:** Automatischer Timeout-Schutzmechanismus (`SessionLock`), der nach konfigurierbarer Inaktivität sperrt, sensible Daten aus dem Speicher entfernt und Methoden zur Restzeitabfrage (`remaining_seconds()`) bietet. Alle Dateipfade werden strikt über `pathlib.Path.resolve()` gegen Path Traversal abgesichert.
-*   **Path-Traversal & XSS-Prävention:** Striktes Absichern aller Pfade über `pathlib.Path.resolve()`, strikte HTML-Content-Security-Policy (`default-src 'none'`), Referrer-Policy (`no-referrer`) sowie HTML-Escaping bei der Berichterstellung.
-*   **Strukturierte Ausnahmehierarchie:** Modulare Exception-Struktur in [security/exceptions.py](file:///c:/E/python/Health-Check-Modul/security/exceptions.py) (`SecurityError`, `AuthenticationError`, `CryptoError`, `KeyDerivationError`, `EncryptionError`, `DecryptionError`, `IntegrityError`, `InvalidMasterPasswordError`, `TooManyFailedAttemptsError`, `SessionExpiredError`) mit typisierten Details, Standardmeldungen und vollständiger Abwärtskompatibilität.
+*   **FTP-Klartext-Schutz & TLS-Erzwingung:** Blockierung unverschlüsselter FTP-Fallbacks standardmäßig (`InsecureFTPError`); gezielte Absicherung und Freigabe nur bei expliziter Nutzerkonfiguration im Shop-Profil.
+*   **Strukturierte Ausnahmehierarchie:** Modulare Exception-Struktur in [security/exceptions.py](file:///c:/E/python/Health-Check-Modul/security/exceptions.py) (`SecurityError`, `AuthenticationError`, `CryptoError`, `KeyDerivationError`, `EncryptionError`, `DecryptionError`, `InsecureFTPError`, `IntegrityError`, `InvalidMasterPasswordError`, `TooManyFailedAttemptsError`, `SessionExpiredError`) mit typisierten Details, Standardmeldungen und vollständiger Abwärtskompatibilität.
 *   **DoS-Schutz bei Berichten:** Pufferbegrenzung (`deque(maxlen=10_000)`) und fehlertolerantes UTF-8-Lesen (`errors="replace"`) verhindern Memory-Exhaustion und Parser-Abstürze bei überdimensionierten oder beschädigten Log-Dateien.
 
 ## 4. Installation
@@ -92,15 +95,17 @@ Health-Check-Modul/
 │   └── reporting.py          # HTML- und PDF-Berichtsgenerierung (XSS-geschützt)
 ├── security/
 │   ├── crypto.py             # Kryptographische Operationen
-│   ├── exceptions.py         # Sicherheitsspezifische Fehlermeldungen
+│   ├── exceptions.py         # Sicherheitsspezifische Fehlermeldungen (inkl. InsecureFTPError)
 │   └── master_password.py    # Masterpasswort- & Session-Management
 ├── ui/
-│   ├── __init__.py           # Paket-Exporte (MainWindow, Pages, Workers, BackupManager, Dialoge)
+│   ├── __init__.py           # Paket-Exporte (MainWindow, Pages, Workers, NetworkService, BackupManager)
 │   ├── backup_actions.py     # Remote-Download & Vorab-Sicherung über FTP/SFTP
 │   ├── backup_manager.py     # Lokale ZIP-Archivierung mit Zip-Slip- & Path-Traversal-Schutz
 │   ├── dialogs.py            # Typisierte GUI-Dialoge (MasterPassword, ShopProfile, Alerts)
 │   ├── hc_php_version_check.php # PHP-Helper für Server-Versionsprüfung
-│   └── main_window.py        # Hauptfenster, Navigation, QThread-Workers & Seiten
+│   ├── main_window.py        # Hauptfenster, Navigation & Seiten
+│   ├── network_service.py    # NetworkService & RemoteFileService (TLS, Verbindung, Datei-Ops)
+│   └── workers.py            # QThread-Hintergrund-Worker (HealthCheck, Delete, BakScan, Logfile)
 ├── tests/                    # Automatisierte Tests (pytest)
 ├── logging_config.py         # Logging-Setup mit Sensitive-Filter
 └── README.md
@@ -182,7 +187,12 @@ python build.py
 *   Verwenden Sie für UI-Erweiterungen ausschließlich die definierten Styles in der `main_window.py`.
 *   Neue Sicherheitsregeln in `bandit` → `--skip`-Ausnahmen nur mit Begründung und Ticket-Referenz.
 
-## 8. Lizenz
+## 8. Roadmap
+
+* [ ] Vorbereitung zum Übertragen des Projekts zu GitHub
+* [ ] Übertragung zu GitHub nach Freigabe
+
+## 9. Lizenz
 
 Dieses Projekt wird unter der **MIT-Lizenz** veröffentlicht.
 

@@ -26,6 +26,7 @@ from ui.main_window import (
     UpdateAnalysisPage,
     open_path,
 )
+from ui.network_service import NetworkService, RemoteFileService
 
 __all__ = [
     "BackupActions",
@@ -39,6 +40,8 @@ __all__ = [
     "MainWindow",
     "ManualPage",
     "MasterPasswordDialog",
+    "NetworkService",
+    "RemoteFileService",
     "ShopProfileDialog",
     "UpdateAnalysisPage",
     "ask_confirmation",

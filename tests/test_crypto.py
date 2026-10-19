@@ -1,4 +1,5 @@
 import pytest
+
 from security.crypto import CryptoManager
 from security.exceptions import InvalidMasterPasswordError
 

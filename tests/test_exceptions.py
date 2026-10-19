@@ -3,11 +3,13 @@ Unittests für die Sicherheits- und Krypto-Ausnahmen in security.exceptions.
 """
 
 import pytest
+
 from security.exceptions import (
     AuthenticationError,
     CryptoError,
     DecryptionError,
     EncryptionError,
+    InsecureFTPError,
     IntegrityError,
     InvalidMasterPasswordError,
     KeyDerivationError,
@@ -107,3 +109,13 @@ def test_crypto_specific_errors():
     integ_err = IntegrityError()
     assert isinstance(integ_err, SecurityError)
     assert str(integ_err) == IntegrityError.DEFAULT_MESSAGE
+
+
+def test_insecure_ftp_error():
+    err = InsecureFTPError()
+    assert isinstance(err, SecurityError)
+    assert str(err) == InsecureFTPError.DEFAULT_MESSAGE
+
+    custom = InsecureFTPError("TLS erforderlich", details={"host": "example.com"})
+    assert str(custom) == "TLS erforderlich"
+    assert custom.details == {"host": "example.com"}

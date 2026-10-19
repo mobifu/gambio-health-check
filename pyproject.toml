@@ -11,3 +11,20 @@ ignore = [
     "F841",  # Unused local variable
     "F811",  # Redefinition of unused import
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"ui/main_window.py" = [
+    "BLE001",  # Legacy Blind except in UI Event-Handlern und Background-Workern
+    "S110",    # Legacy try-except-pass in Netzwerk-Workern
+    "S112",    # Legacy try-except-continue
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "ui.*"
+ignore_errors = true

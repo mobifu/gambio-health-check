@@ -2,7 +2,7 @@ import html
 import json
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -122,13 +122,16 @@ def generate_pdf_report(
         doc.setHtml(html_content)
 
         printer = QPrinter()
-        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(str(target_path))
 
         doc.print_(printer)
         return True
-    except Exception as e:
+    except (OSError, RuntimeError) as e:
         logger.error(f"Fehler beim Erstellen der PDF {output_path}: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Unerwarteter Fehler beim Erstellen der PDF {output_path}: {e}")
         return False
 
 
@@ -141,10 +144,10 @@ def _get_latest_log_file(log_dir: str | Path) -> str:
         files = [p for p in dir_path.glob("*.log") if p.is_file()]
         if not files:
             return ""
-        # Bevorzuge st_mtime mit Fallback auf st_ctime
+        # Bevorzuge st_mtime für zuverlässige Bestimmung der neuesten Logdatei
         latest = max(
             files,
-            key=lambda f: max(f.stat().st_mtime, f.stat().st_ctime),
+            key=lambda f: f.stat().st_mtime,
         )
         return str(latest)
     except OSError as e:
@@ -168,7 +171,7 @@ def _determine_css_class(level: str, msg: str) -> str:
 def _build_html(profile_name: str, entries: list[dict[str, Any]]) -> str:
     """Erzeugt ein sicheres HTML5-Dokument mit Content-Security-Policy und XSS-Escaping."""
     safe_profile = html.escape(str(profile_name), quote=True)
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    now_str = datetime.now(timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M:%S")
 
     total_count = len(entries)
     error_count = sum(

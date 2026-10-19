@@ -1,7 +1,9 @@
-import pytest
 import sys
 from unittest.mock import MagicMock
+
+import pytest
 from PySide6.QtWidgets import QApplication
+
 from ui.main_window import HealthCheckPage
 
 

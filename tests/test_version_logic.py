@@ -1,11 +1,13 @@
-import pytest
-import sys
 import ftplib
-import os
-import json
 import hashlib
-from unittest.mock import MagicMock, ANY, patch, mock_open, call
+import json
+import os
+import sys
+from unittest.mock import ANY, MagicMock, call, mock_open, patch
+
+import pytest
 from PySide6.QtWidgets import QApplication
+
 from ui.main_window import HealthCheckPage
 
 
@@ -612,7 +614,7 @@ def test_directory_traversal_prevention(page):
 
     # generate_hash sollte hier sicherstellen, dass nicht außerhalb gearbeitet wird.
     # Da FTP relative Pfade auf dem Server nutzt, verhindern wir das Ausbrechen.
-    h, data = engine.generate_hash(traversal_path)
+    h, _data = engine.generate_hash(traversal_path)
     # Wenn die Engine das nicht explizit blockiert, stellen wir sicher, dass sie fehlschlägt oder abgewiesen wird
     # Falls das System unsicher ist, fangen wir das ab.
     assert h is None
@@ -649,12 +651,12 @@ def test_network_timeout_robustness(page):
     # Simuliere socket timeout bei FTP connect
     signal = MagicMock()
 
-    # Mock ftplib.FTP so dass ein Timeout geworfen wird
+    def mock_ftp_cls(*args, **kwargs):
+        return MagicMock(connect=MagicMock(side_effect=TimeoutError("Timeout!")))
+
     with pytest.MonkeyPatch().context() as m:
-        m.setattr(
-            "ftplib.FTP",
-            lambda *args, **kwargs: MagicMock(connect=MagicMock(side_effect=socket.timeout("Timeout!"))),
-        )
+        m.setattr("ftplib.FTP", mock_ftp_cls)
+        m.setattr("ftplib.FTP_TLS", mock_ftp_cls)
 
         conn, files = page._check_connection(profile, signal)
         assert conn is None
@@ -895,8 +897,9 @@ def test_legacy_delete_worker_recursive_ftp(page):
 
 def test_legacy_delete_worker_recursive_sftp(page):
     """Testet, dass der LegacyDeleteWorker Ordner und Dateien rekursiv via SFTP löschen kann."""
-    from ui.main_window import LegacyDeleteWorker
     import stat
+
+    from ui.main_window import LegacyDeleteWorker
 
     # Mock paramiko SFTP connection
     conn = MagicMock()
@@ -982,8 +985,9 @@ def test_legacy_delete_worker_clear_cache_ftp(page):
 
 def test_legacy_delete_worker_clear_cache_sftp(page):
     """Testet die automatische Cache-Löschung via SFTP (nur Dateien, Ordner verschont, Ausnahmen geschützt)."""
-    from ui.main_window import LegacyDeleteWorker
     import stat
+
+    from ui.main_window import LegacyDeleteWorker
 
     conn = MagicMock()
     page._check_connection = MagicMock(return_value=(conn, []))

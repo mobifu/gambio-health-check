@@ -2,7 +2,7 @@
 Sicherheits- und Krypto-Ausnahmen für das Health-Check-Modul.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class SecurityError(Exception):
@@ -12,9 +12,9 @@ class SecurityError(Exception):
 
     def __init__(
         self,
-        message: Optional[str] = None,
+        message: str | None = None,
         *args: Any,
-        details: Optional[Dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         self.message = message if message is not None else self.DEFAULT_MESSAGE
         self.details = details if details is not None else {}
@@ -81,11 +81,11 @@ class TooManyFailedAttemptsError(AuthenticationError):
 
     def __init__(
         self,
-        message: Optional[str] = None,
+        message: str | None = None,
         *args: Any,
-        failed_attempts: Optional[int] = None,
-        lockout_duration: Optional[float] = None,
-        details: Optional[Dict[str, Any]] = None,
+        failed_attempts: int | None = None,
+        lockout_duration: float | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         merged_details = dict(details) if details else {}
         if failed_attempts is not None:
@@ -105,10 +105,10 @@ class SessionExpiredError(AuthenticationError):
 
     def __init__(
         self,
-        message: Optional[str] = None,
+        message: str | None = None,
         *args: Any,
-        timeout_minutes: Optional[int] = None,
-        details: Optional[Dict[str, Any]] = None,
+        timeout_minutes: int | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         merged_details = dict(details) if details else {}
         if timeout_minutes is not None:
@@ -118,15 +118,28 @@ class SessionExpiredError(AuthenticationError):
         super().__init__(message, *args, details=merged_details)
 
 
+class InsecureFTPError(SecurityError):
+    """
+    Wird geworfen, wenn eine unverschlüsselte FTP-Verbindung ohne explizite Erlaubnis
+    aufgebaut werden soll oder FTPS fehlschlägt.
+    """
+
+    DEFAULT_MESSAGE: str = (
+        "Unverschlüsselte FTP-Verbindungen sind standardmäßig deaktiviert. "
+        "Bitte TLS/FTPS nutzen oder Klartext-Fallback explizit im Profil erlauben."
+    )
+
+
 __all__ = [
-    "SecurityError",
     "AuthenticationError",
     "CryptoError",
-    "KeyDerivationError",
-    "EncryptionError",
     "DecryptionError",
+    "EncryptionError",
+    "InsecureFTPError",
     "IntegrityError",
     "InvalidMasterPasswordError",
-    "TooManyFailedAttemptsError",
+    "KeyDerivationError",
+    "SecurityError",
     "SessionExpiredError",
+    "TooManyFailedAttemptsError",
 ]

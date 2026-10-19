@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import getpass
 import time
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional, Union
 
 from security.exceptions import (
     InvalidMasterPasswordError,
@@ -26,25 +26,31 @@ class SessionLock:
 
     def __init__(
         self,
-        config_path: Union[str, Path] = "config.dat",
-        timeout_minutes: Union[int, float] = DEFAULT_TIMEOUT_MINUTES,
+        config_path: str | Path = "config.dat",
+        timeout_minutes: float = DEFAULT_TIMEOUT_MINUTES,
     ) -> None:
         # Pfad strikt via pathlib.Path.resolve() absichern
         self.config_path: str = str(Path(config_path).resolve())
         self.timeout: timedelta = timedelta(minutes=timeout_minutes)
-        self.last_activity: datetime = datetime.now()
+        self.last_activity: datetime = datetime.now(timezone.utc)
 
     def update_activity(self) -> None:
         """Aktualisiert den Zeitstempel der letzten Aktivität."""
-        self.last_activity = datetime.now()
+        self.last_activity = datetime.now(timezone.utc)
+
+    def _get_elapsed(self) -> timedelta:
+        """Berechnet die verstrichene Zeit robust gegen naive und aware Datetime-Objekte."""
+        if self.last_activity.tzinfo is None:
+            return datetime.now() - self.last_activity  # noqa: DTZ005
+        return datetime.now(timezone.utc) - self.last_activity
 
     def is_expired(self) -> bool:
         """Prüft, ob der Inaktivitätszeitraum überschritten wurde."""
-        return datetime.now() - self.last_activity > self.timeout
+        return self._get_elapsed() > self.timeout
 
     def remaining_seconds(self) -> float:
         """Gibt die verbleibende Session-Gültigkeit in Sekunden zurück (mindestens 0.0)."""
-        elapsed = datetime.now() - self.last_activity
+        elapsed = self._get_elapsed()
         remaining = self.timeout.total_seconds() - elapsed.total_seconds()
         return max(0.0, remaining)
 
@@ -68,11 +74,11 @@ class MasterPasswordManager:
     def __init__(
         self,
         is_new_setup: bool = False,
-        session_lock: Optional[SessionLock] = None,
+        session_lock: SessionLock | None = None,
         timeout_minutes: int = SessionLock.DEFAULT_TIMEOUT_MINUTES,
     ) -> None:
         self.is_new_setup: bool = is_new_setup
-        self._master_password: Optional[str] = None
+        self._master_password: str | None = None
         self._failed_attempts: int = 0
         self._max_attempts_before_delay: int = self.MAX_ATTEMPTS_BEFORE_DELAY
         self._session_lock: SessionLock = (
@@ -106,7 +112,7 @@ class MasterPasswordManager:
         self.reset_attempts()
         self.update_activity()
 
-    def get_password(self) -> Optional[str]:
+    def get_password(self) -> str | None:
         """Gibt das aktuell im RAM befindliche Passwort zurück."""
         return self._master_password
 
@@ -147,7 +153,8 @@ class MasterPasswordManager:
                 for i in range(len(pwd_bytes)):
                     pwd_bytes[i] = 0
                 del pwd_bytes
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
+                # Defensive Bereinigung im Destruktor/Clear darf niemals fehlschlagen
                 pass
         self._master_password = None
 

@@ -3,12 +3,13 @@ Modul zur sicheren Verwaltung verschlüsselter Konfigurationsdaten.
 """
 
 import base64
+import binascii
 import copy
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any
 
 from security.crypto import CryptoManager
 from security.exceptions import InvalidMasterPasswordError
@@ -16,7 +17,7 @@ from security.exceptions import InvalidMasterPasswordError
 logger = logging.getLogger(__name__)
 
 # Standardkonfiguration
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "profiles": [],
     "excluded_files": "paypal3.php",
     "max_log_age": 7,
@@ -32,16 +33,16 @@ class ConfigManager:
     Nutzt CryptoManager für die Verschlüsselung und stellt atomares Schreiben sicher.
     """
 
-    def __init__(self, config_path: Union[str, Path] = "config.dat") -> None:
+    def __init__(self, config_path: str | Path = "config.dat") -> None:
         """
         Initialisiert den ConfigManager mit einem gesicherten Pfad.
         """
         self._path: Path = Path(config_path).resolve()
         self.config_path: str = str(self._path)
-        self._data: Dict[str, Any] = self._get_default_config()
+        self._data: dict[str, Any] = self._get_default_config()
 
     @staticmethod
-    def _get_default_config() -> Dict[str, Any]:
+    def _get_default_config() -> dict[str, Any]:
         """
         Gibt eine frische Kopie der Standardkonfiguration zurück.
         """
@@ -53,13 +54,13 @@ class ConfigManager:
         """
         return self._path.is_file()
 
-    def get_all_data(self) -> Dict[str, Any]:
+    def get_all_data(self) -> dict[str, Any]:
         """
         Gibt eine vollständige Kopie der aktuellen internen Konfigurationsdaten zurück.
         """
         return copy.deepcopy(self._data)
 
-    def save_config(self, data: Dict[str, Any], password: str) -> None:
+    def save_config(self, data: dict[str, Any], password: str) -> None:
         """
         Verschlüsselt und speichert die Konfigurationsdaten atomar.
         """
@@ -90,8 +91,10 @@ class ConfigManager:
             # Restriktive Dateizugriffsrechte (nur Besitzer)
             try:
                 os.chmod(self.config_path, 0o600)
-            except Exception:
-                # chmod schlägt auf einigen Systemen (z.B. Windows) fehl
+            except OSError:
+                # chmod wird unter Windows/Nicht-POSIX ignoriert oder schlägt fehl
+                pass
+            except Exception:  # noqa: BLE001, S110
                 pass
 
             logger.info("Konfiguration erfolgreich verschlüsselt und atomar gespeichert.")
@@ -102,9 +105,9 @@ class ConfigManager:
                 except OSError:
                     pass
             logger.error("Fehler beim Speichern der Konfiguration: %s", type(e).__name__)
-            raise IOError(f"Fehler beim Speichern der Konfiguration: {str(e)}") from e
+            raise OSError(f"Fehler beim Speichern der Konfiguration: {e!s}") from e
 
-    def load_config(self, password: str) -> Dict[str, Any]:
+    def load_config(self, password: str) -> dict[str, Any]:
         """
         Lädt und entschlüsselt die Konfiguration.
         Gibt ein leeres Dict zurück, wenn die Datei nicht existiert.
@@ -133,7 +136,7 @@ class ConfigManager:
             # JSON Deserialisierung
             loaded_json = json.loads(decrypted.decode("utf-8"))
             if not isinstance(loaded_json, dict):
-                raise ValueError("Entschlüsselte Nutzdaten müssen ein JSON-Objekt sein.")
+                raise TypeError("Entschlüsselte Nutzdaten müssen ein JSON-Objekt sein.")
 
             # Merge mit Defaults, damit neu hinzugefügte Standardeinstellungen existieren
             merged_data = self._get_default_config()
@@ -146,7 +149,8 @@ class ConfigManager:
             json.JSONDecodeError,
             KeyError,
             ValueError,
-            base64.binascii.Error,
+            TypeError,
+            binascii.Error,
             InvalidMasterPasswordError,
         ):
             logger.warning("Ungültiges Master-Passwort oder beschädigte Konfigurationsdatei.")
@@ -157,13 +161,16 @@ class ConfigManager:
             logger.error("Unerwarteter Fehler beim Laden der Konfiguration: %s", type(e).__name__)
             raise InvalidMasterPasswordError(f"Ein unerwarteter Fehler ist aufgetreten: {type(e).__name__}") from e
 
-    def get_profiles(self) -> List[Dict[str, Any]]:
+    def get_profiles(self) -> list[dict[str, Any]]:
         """
         Gibt die Liste der gespeicherten Shop-Profile zurück.
         """
-        return self._data.get("profiles", [])
+        profiles = self._data.get("profiles", [])
+        if isinstance(profiles, list):
+            return profiles
+        return []
 
-    def set_profiles(self, profiles: List[Dict[str, Any]]) -> None:
+    def set_profiles(self, profiles: list[dict[str, Any]]) -> None:
         """
         Setzt die Liste der Shop-Profile im internen Datenmodell.
         """
@@ -175,7 +182,8 @@ class ConfigManager:
         """
         Gibt die kommagetrennte Liste der zu ignorierenden Dateien zurück.
         """
-        return self._data.get("excluded_files", DEFAULT_CONFIG["excluded_files"])
+        val = self._data.get("excluded_files", DEFAULT_CONFIG["excluded_files"])
+        return str(val) if isinstance(val, str) else str(DEFAULT_CONFIG["excluded_files"])
 
     def set_excluded_files(self, files_str: str) -> None:
         """
@@ -189,7 +197,8 @@ class ConfigManager:
         """
         Gibt das maximale Alter der Logfiles in Tagen zurück.
         """
-        return self._data.get("max_log_age", DEFAULT_CONFIG["max_log_age"])
+        val = self._data.get("max_log_age", DEFAULT_CONFIG["max_log_age"])
+        return int(val) if isinstance(val, int) else int(DEFAULT_CONFIG["max_log_age"])
 
     def set_max_log_age(self, days: int) -> None:
         """
@@ -203,7 +212,8 @@ class ConfigManager:
         """
         Gibt den Namen des zuletzt ausgewählten Profils zurück.
         """
-        return self._data.get("last_selected_profile_name", "")
+        val = self._data.get("last_selected_profile_name", "")
+        return str(val) if isinstance(val, str) else ""
 
     def set_last_selected_profile_name(self, name: str) -> None:
         """

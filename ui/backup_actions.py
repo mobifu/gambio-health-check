@@ -5,7 +5,7 @@ Ermöglicht das automatisierte Sichern von Remote-Dateien vor deren Löschung
 über FTP und SFTP.
 """
 
-import ftplib
+import ftplib  # nosec B402 # Wird für FTP-Verbindungsprüfung und Datei-Downloads benötigt
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -82,7 +82,12 @@ class BackupActions:
             dest_file = (resolved_target / safe_rel_name).resolve()
 
             # Path Traversal Check
-            if not str(dest_file).startswith(str(resolved_target)):
+            try:
+                if not dest_file.is_relative_to(resolved_target) or dest_file == resolved_target:
+                    logger.warning("Ungültiger Pfad übersprungen: %s", file_path)
+                    failed.append(file_path)
+                    continue
+            except (ValueError, AttributeError):
                 logger.warning("Ungültiger Pfad übersprungen: %s", file_path)
                 failed.append(file_path)
                 continue

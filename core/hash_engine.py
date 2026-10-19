@@ -1,4 +1,4 @@
-import ftplib
+import ftplib  # nosec B402 # Für FTP/FTPS Fallback-Unterstützung und Typ-Prüfungen
 import hashlib
 import io
 import json
@@ -7,7 +7,7 @@ import os
 import re
 import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 
 class HashCheckEngine:
@@ -21,7 +21,7 @@ class HashCheckEngine:
         profile_name: str,
         conn: Any,
         signal: Any = None,
-        logger: logging.Logger | None = None,
+        logger: Any = None,
         worker: Any = None,
     ):
         self.profile_name = profile_name
@@ -32,7 +32,7 @@ class HashCheckEngine:
 
         # Pfadsicherheit via pathlib und Path Traversal Absicherung
         base_profiles_dir = Path("profiles").resolve()
-        safe_name = re.sub(r'[\\/*?:"<>| &]', "_", str(profile_name).strip())
+        safe_name = re.sub(r'[\\/*?:"<>| &]', "_", profile_name.strip())
         if not safe_name:
             safe_name = "default"
 
@@ -99,7 +99,7 @@ class HashCheckEngine:
                 # Versuch 1: Direkter Download mit relativem Pfad (meist am stabilsten)
                 try:
                     self.conn.retrbinary(f"RETR {remote_path}", buf.write)
-                except Exception:
+                except (ftplib.Error, OSError):
                     # Versuch 2: Fallback mit Navigation (für restriktive Server)
                     buf = io.BytesIO()
                     parts = normalized.split("/")
@@ -122,9 +122,13 @@ class HashCheckEngine:
 
             data = buf.getvalue()
             return hashlib.sha256(data).hexdigest(), data
-        except Exception as e:
+        except (ftplib.Error, OSError, EOFError) as e:
             if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
                 self._log(f"Datei konnte nicht gelesen werden: {remote_path} ({e})", "warn")
+            return None, None
+        except Exception as e:  # noqa: BLE001
+            if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
+                self._log(f"Unerwarteter Fehler beim Lesen: {remote_path} ({e})", "warn")
             return None, None
 
     def _check_malware_indicators(self, data: bytes | None, path: str) -> None:
@@ -197,7 +201,7 @@ class HashCheckEngine:
                             if target_type == "dir":
                                 try:
                                     self.conn.cwd(name)
-                                except Exception:
+                                except (ftplib.Error, OSError):
                                     continue
                                 try:
                                     walk(full_item)
@@ -210,12 +214,12 @@ class HashCheckEngine:
                                 files.append(full_item)
                                 self._log(f"Datei gefunden: {full_item}", skip_ui=True)
 
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         # Fallback: LIST-Befehl parsen (robuster als nlst)
                         lines: list[str] = []
                         try:
                             self.conn.retrlines("LIST", lines.append)
-                        except Exception:
+                        except (ftplib.Error, OSError):
                             pass
 
                         if not lines:
@@ -245,7 +249,7 @@ class HashCheckEngine:
                                         try:
                                             self.conn.cwd(name)
                                             is_dir = True
-                                        except Exception:
+                                        except (ftplib.Error, OSError):
                                             pass
 
                                         if is_dir:
@@ -255,7 +259,7 @@ class HashCheckEngine:
                                                 self.conn.cwd("..")
                                         else:
                                             files.append(full_item)
-                            except Exception:
+                            except (ftplib.Error, OSError):
                                 pass
                         else:
                             for line in lines:
@@ -276,7 +280,7 @@ class HashCheckEngine:
                                 if line.startswith("d"):
                                     try:
                                         self.conn.cwd(name)
-                                    except Exception:
+                                    except (ftplib.Error, OSError):
                                         continue
                                     try:
                                         walk(full_item)
@@ -297,7 +301,7 @@ class HashCheckEngine:
                                     try:
                                         self.conn.cwd(name)
                                         is_dir = True
-                                    except Exception:
+                                    except (ftplib.Error, OSError):
                                         pass
 
                                     if is_dir:
@@ -325,9 +329,12 @@ class HashCheckEngine:
                                 continue
                             files.append(full_p)
                             self._log(f"Datei gefunden: {full_p}", skip_ui=True)
-            except Exception as e:
+            except (ftplib.Error, OSError, EOFError) as e:
                 if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
                     self.logger.warning(f"Verzeichnis übersprungen oder leer: {current_path} ({e})")
+            except Exception as e:  # noqa: BLE001
+                if not (self.worker and getattr(self.worker, "_is_cancelled", False)):
+                    self.logger.warning(f"Unerwarteter Fehler bei Verzeichnis: {current_path} ({e})")
 
         walk(path)
         # Am Ende wiederherstellen des ursprünglichen FTP-Arbeitsverzeichnisses
@@ -385,13 +392,13 @@ class HashCheckEngine:
         """Speichert Hashes für Dateien eines spezifischen Updates."""
         target_file = Path(self.hash_dir) / f"update_{update_version}.json"
         hashes: dict[str, str] = {}
-        for f in file_list:
-            h, _ = self.generate_hash(f)
+        for file_item in file_list:
+            h, _ = self.generate_hash(file_item)
             if h:
-                hashes[f] = h
+                hashes[file_item] = h
         try:
-            with open(target_file, "w", encoding="utf-8") as f:
-                json.dump(hashes, f, indent=4)
+            with open(target_file, "w", encoding="utf-8") as out_fh:
+                json.dump(hashes, out_fh, indent=4)
         except OSError as e:
             self.logger.error(f"Fehler beim Speichern der Update-Hashes in {target_file}: {e}")
 
@@ -402,8 +409,8 @@ class HashCheckEngine:
             return
 
         try:
-            with open(self.baseline_path, "r", encoding="utf-8") as f:
-                baseline = json.load(f)
+            with open(self.baseline_path, "r", encoding="utf-8") as in_fh:
+                baseline = json.load(in_fh)
         except (OSError, json.JSONDecodeError) as e:
             self._log(f"Fehler beim Laden der Baseline {self.baseline_path}: {e}", "error")
             return
@@ -413,35 +420,35 @@ class HashCheckEngine:
         current_files = self._get_remote_files_recursive()
         total = len(current_files)
 
-        for i, f in enumerate(current_files):
+        for i, file_path in enumerate(current_files):
             if self.worker and getattr(self.worker, "_is_cancelled", False):
                 return
 
             # Check ignored list
-            if any(ex in f for ex in self.excluded_list):
+            if any(ex in file_path for ex in self.excluded_list):
                 continue
 
             if i % 500 == 0:
                 self._progress(f"Prüfe Datei {i + 1} von {total}...")
-            current_h, data = self.generate_hash(f)
+            current_h, data = self.generate_hash(file_path)
             if not current_h:
                 continue
 
-            if f not in baseline:
-                self._log(f"Unbekannte Datei gefunden: {f}", "warn")
-                self._check_malware_indicators(data, f)
-            elif baseline[f] != current_h:
+            if file_path not in baseline:
+                self._log(f"Unbekannte Datei gefunden: {file_path}", "warn")
+                self._check_malware_indicators(data, file_path)
+            elif baseline[file_path] != current_h:
                 self._log(
-                    f"Datei verändert: {f}\nErwartet: {baseline[f][:16]}...\nGefunden: {current_h[:16]}...",
+                    f"Datei verändert: {file_path}\nErwartet: {baseline[file_path][:16]}...\nGefunden: {current_h[:16]}...",
                     "warn",
                 )
-                self._check_malware_indicators(data, f)
+                self._check_malware_indicators(data, file_path)
 
-        for f in baseline:
-            if any(ex in f for ex in self.excluded_list):
+        for baseline_file in baseline:
+            if any(ex in baseline_file for ex in self.excluded_list):
                 continue
-            if f not in current_files:
-                self._log(f"Datei fehlt: {f}", "error")
+            if baseline_file not in current_files:
+                self._log(f"Datei fehlt: {baseline_file}", "error")
 
     def compare_with_update_hashes(self, update_version: str) -> None:
         """Prüft, ob Update-Dateien korrekt auf dem Server liegen."""
@@ -450,18 +457,18 @@ class HashCheckEngine:
             return
 
         try:
-            with open(target_file, "r", encoding="utf-8") as f:
-                update_hashes = json.load(f)
+            with open(target_file, "r", encoding="utf-8") as update_fh:
+                update_hashes = json.load(update_fh)
         except (OSError, json.JSONDecodeError) as e:
             self.logger.error(f"Fehler beim Laden der Update-Hashes aus {target_file}: {e}")
             return
 
         self._log(f"Prüfe Integrität von Update {update_version}...")
-        for f, expected_h in update_hashes.items():
-            if any(ex in f for ex in self.excluded_list):
+        for check_file, expected_h in update_hashes.items():
+            if any(ex in check_file for ex in self.excluded_list):
                 continue
-            current_h, _ = self.generate_hash(f)
+            current_h, _ = self.generate_hash(check_file)
             if not current_h:
-                self._log(f"Update-Datei fehlt: {f}", "error")
+                self._log(f"Update-Datei fehlt: {check_file}", "error")
             elif current_h != expected_h:
-                self._log(f"Update-Datei wurde nachträglich verändert: {f}", "error")
+                self._log(f"Update-Datei wurde nachträglich verändert: {check_file}", "error")

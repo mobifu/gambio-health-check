@@ -8,14 +8,13 @@ SOFTWARE_VERSION = "1.1.5"
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
 
 try:
     from PySide6.QtWidgets import QApplication
 except ImportError:
     # Fallback-Klasse für Umgebungen ohne PySide6 (z. B. Headless CI oder Testumgebungen)
     class QApplication:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs):
+        def __init__(self, *args: object, **kwargs: object) -> None:
             pass
 
         def exec(self) -> int:
@@ -24,7 +23,7 @@ except ImportError:
 
 from config.config_manager import ConfigManager
 from logging_config import setup_logging
-from security.exceptions import InvalidMasterPasswordError
+from security.exceptions import InvalidMasterPasswordError, SecurityError
 from security.master_password import MasterPasswordManager
 from ui.dialogs import MasterPasswordDialog, show_error
 from ui.main_window import MainWindow
@@ -81,7 +80,11 @@ def authenticate_user(
         logger.warning("Authentifizierung fehlgeschlagen: Ungültiges Masterpasswort.")
         show_error(str(err))
         return False
-    except Exception as err:
+    except SecurityError as err:
+        logger.error("Sicherheitsfehler während der Authentifizierung: %s", err)
+        show_error(f"Sicherheitsfehler: {err}")
+        return False
+    except Exception as err:  # noqa: BLE001
         logger.error("Unerwarteter Fehler während der Authentifizierung: %s", err)
         show_error(f"Unerwarteter Fehler bei der Authentifizierung: {err}")
         return False

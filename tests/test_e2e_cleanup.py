@@ -1,7 +1,8 @@
-import pytest
 import ftplib
-from unittest.mock import MagicMock, call
 import sys
+from unittest.mock import MagicMock, call
+
+import pytest
 from PySide6.QtWidgets import QApplication
 
 

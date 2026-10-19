@@ -1,14 +1,16 @@
-import pytest
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
-from security.master_password import MasterPasswordManager, SessionLock
+
+import pytest
+
 from security.exceptions import (
     InvalidMasterPasswordError,
-    TooManyFailedAttemptsError,
     SessionExpiredError,
+    TooManyFailedAttemptsError,
 )
+from security.master_password import MasterPasswordManager, SessionLock
 
 
 def test_master_password_setting():

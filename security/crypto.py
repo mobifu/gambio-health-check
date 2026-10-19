@@ -11,6 +11,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
 from security.exceptions import InvalidMasterPasswordError
 
 
@@ -89,7 +90,7 @@ class CryptoManager:
             raise InvalidMasterPasswordError("Master-Passwort ist falsch oder die Konfigurationsdaten sind korrupt.")
 
     @staticmethod
-    def encrypt_aes_gcm(data: bytes, key: bytes, associated_data: Optional[bytes] = None) -> bytes:
+    def encrypt_aes_gcm(data: bytes, key: bytes, associated_data: bytes | None = None) -> bytes:
         """
         Verschlüsselt Rohdaten mit AES-256-GCM.
         Erzeugt eine kryptographisch sichere 12-Byte-Nonce über secrets und gibt Nonce + Chiffretext (+ 16-Byte Tag) zurück.
@@ -105,7 +106,7 @@ class CryptoManager:
         return nonce + ciphertext
 
     @staticmethod
-    def decrypt_aes_gcm(payload: bytes, key: bytes, associated_data: Optional[bytes] = None) -> bytes:
+    def decrypt_aes_gcm(payload: bytes, key: bytes, associated_data: bytes | None = None) -> bytes:
         """
         Entschlüsselt ein mit AES-256-GCM verschlüsseltes Datenpaket (12-Byte Nonce + Chiffretext + Tag).
         Wirft InvalidMasterPasswordError, wenn der Schlüssel ungültig oder die Daten manipuliert wurden.
@@ -129,7 +130,7 @@ class CryptoManager:
             ) from exc
 
     @staticmethod
-    def encrypt_gcm(data: bytes, password: str, salt: bytes, associated_data: Optional[bytes] = None) -> str:
+    def encrypt_gcm(data: bytes, password: str, salt: bytes, associated_data: bytes | None = None) -> str:
         """
         Komfort-Methode: Leitet einen 256-Bit Schlüssel ab, verschlüsselt mit AES-256-GCM und gibt
         einen URL-sicheren Base64-String zurück.
@@ -139,7 +140,7 @@ class CryptoManager:
         return base64.urlsafe_b64encode(payload).decode("utf-8")
 
     @staticmethod
-    def decrypt_gcm(token: str, password: str, salt: bytes, associated_data: Optional[bytes] = None) -> bytes:
+    def decrypt_gcm(token: str, password: str, salt: bytes, associated_data: bytes | None = None) -> bytes:
         """
         Komfort-Methode: Dekodiert den Base64-Token, leitet den 256-Bit Schlüssel ab und entschlüsselt mit AES-256-GCM.
         """

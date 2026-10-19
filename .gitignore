@@ -21,8 +21,8 @@ venv/
 .agignore
 .coverage
 
-# Temporäre Daten & Profil-Logs/Hashes
-profiles/*/logs/
-profiles/*/hashes/
+# Lokale Hilfsskripte & Profile / Private Daten
+sichern.py
+profiles/
 *.log
 config.dat

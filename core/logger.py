@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
+import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Self
+from typing import IO
+
+if sys.version_info >= (3, 11):
+    from typing import Self
+else:
+    from typing_extensions import Self
 
 from logging_config import sanitize_sensitive_data
 
@@ -18,7 +26,7 @@ class HealthCheckLogger:
     Unterstützt auch Context-Manager-Protokoll (with HealthCheckLogger(...) as log:).
     """
 
-    def __init__(self, profile_name: str):
+    def __init__(self, profile_name: str) -> None:
         # Pfadsicherheit via pathlib und Path Traversal Absicherung
         base_profiles_dir = Path("profiles").resolve()
         safe_name = re.sub(r'[\\/*?:"<>| &]', "_", profile_name.strip())
@@ -38,14 +46,14 @@ class HealthCheckLogger:
             logger.error(f"Fehler beim Erstellen des Log-Verzeichnisses {self.log_dir}: {e}")
 
         self.current_file: str | None = None
-        self.file_handle = None
+        self.file_handle: IO[str] | None = None
         self._lock = threading.Lock()
 
     def __enter__(self) -> Self:
         self.start_session()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.end_session()
 
     def start_session(self) -> None:
@@ -58,10 +66,11 @@ class HealthCheckLogger:
                     pass
                 self.file_handle = None
 
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            timestamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
             self.current_file = str(Path(self.log_dir) / f"{timestamp}.log")
             try:
-                self.file_handle = open(self.current_file, "a", encoding="utf-8")
+                # Session-basiertes Dateihandle wird über Lebenszyklus der Sitzung gehalten
+                self.file_handle = open(self.current_file, "a", encoding="utf-8")  # noqa: SIM115
                 logger.info(f"Sitzungs-Log erstellt: {self.current_file}")
             except OSError as e:
                 logger.error(f"Fehler beim Öffnen der Log-Datei {self.current_file}: {e}")
@@ -77,7 +86,7 @@ class HealthCheckLogger:
     def log(self, level: str, message: str) -> None:
         """Schreibt einen JSON-Eintrag (JSON-Line) thread-sicher in die Datei."""
         entry = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
             "level": str(level).upper(),
             "msg": self._sanitize(message),
         }
