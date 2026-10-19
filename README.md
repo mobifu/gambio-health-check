@@ -193,14 +193,12 @@ python build.py
 
 ## 8. Roadmap
 
-* [ ] Vorbereitung zum Übertragen des Projekts zu GitHub
-* [ ] Übertragung zu GitHub nach Freigabe
+* [x] Vorbereitung zum Übertragen des Projekts zu GitHub
+* [x] Übertragung zu GitHub und Bereitstellung des Releases v1.1.6
 
 ## 9. Lizenz
 
-Dieses Projekt wird unter der **MIT-Lizenz** veröffentlicht.
-
-*Empfehlung:* Die MIT-Lizenz ist ideal für dieses Tool, da sie eine breite Nutzung und Weiterentwicklung ermöglicht, während die Haftung für die lokale Ausführung ausgeschlossen bleibt.
+Dieses Projekt ist unter der [GNU General Public License v3.0 (GPLv3)](LICENSE) lizenziert. Siehe [LICENSE](LICENSE) für Details.
 
 ---
 *Entwickelt für die Gambio-Community.*
