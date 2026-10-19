@@ -2,6 +2,10 @@
 
 Ein leistungsstarkes, lokal ausgeführtes Desktop-Werkzeug zur Überprüfung der Systemintegrität und Update-Vorbereitung für Gambio-Shopsysteme.
 
+<p align="center">
+  <img src="documents/gambio-health-check.png" alt="Gambio Health Check Vorschau" width="800">
+</p>
+
 ## 1. Projektübersicht
 
 Der **Gambio Health Check** unterstützt Shopbetreiber, Agenturen und Entwickler dabei, Gambio-Installationen proaktiv zu überwachen und reibungslose Update-Prozesse zu gewährleisten.

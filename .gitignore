@@ -23,6 +23,7 @@ venv/
 
 # Lokale Hilfsskripte & Profile / Private Daten
 sichern.py
+start_venv.bat
 profiles/
 *.log
 config.dat
