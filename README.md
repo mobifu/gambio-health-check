@@ -1,10 +1,26 @@
+<div align="center">
+
 # Gambio Health Check
 
-Ein leistungsstarkes, lokal ausgeführtes Desktop-Werkzeug zur Überprüfung der Systemintegrität und Update-Vorbereitung für Gambio-Shopsysteme.
+**Ein leistungsstarkes, lokal ausgeführtes Desktop-Werkzeug zur Überprüfung der Systemintegrität und Update-Vorbereitung für Gambio-Shopsysteme.**
 
-<p align="center">
-  <img src="documents/gambio-health-check.png" alt="Gambio Health Check Vorschau" width="800">
-</p>
+[![Release](https://img.shields.io/github/v/release/mobifu/gambio-health-check?style=for-the-badge&color=blue)](https://github.com/mobifu/gambio-health-check/releases)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-green.svg?style=for-the-badge)](LICENSE)
+[![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue?style=for-the-badge&logo=python)](https://www.python.org)
+[![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey?style=for-the-badge&logo=windows)](https://github.com/mobifu/gambio-health-check/releases)
+[![CI/CD](https://img.shields.io/github/actions/workflow/status/mobifu/gambio-health-check/release.yml?style=for-the-badge&label=Build%20%26%20Release)](https://github.com/mobifu/gambio-health-check/actions)
+
+<br/>
+
+<img src="documents/gambio-health-check.png" alt="Gambio Health Check Vorschau" width="800" style="border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
+
+<br/>
+
+[📥 **Download Executable (Releases)**](https://github.com/mobifu/gambio-health-check/releases) • [🔍 **Features**](#2-features) • [📖 **Handbuch**](USER_MANUAL.md) • [🔒 **Sicherheit**](#sicherheitsstandards--datenschutz) • [📄 **Lizenz**](#9-lizenz)
+
+</div>
+
+---
 
 ## 1. Projektübersicht
 
