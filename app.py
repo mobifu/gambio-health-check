@@ -3,7 +3,7 @@ Haupt-Einstiegspunkt für die Gambio Health Check Desktop-Anwendung.
 Initialisiert Logging, Authentifizierung, Konfiguration und die grafische Benutzeroberfläche.
 """
 
-SOFTWARE_VERSION = "1.1.5"
+SOFTWARE_VERSION = "1.1.6"
 
 import logging
 import sys
